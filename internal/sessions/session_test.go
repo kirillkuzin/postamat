@@ -1,6 +1,7 @@
 package sessions_test
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -32,24 +33,95 @@ func TestNewP2PShareAppliesSafeDefaults(t *testing.T) {
 	}
 }
 
-func TestNewP2PShareRejectsInvalidFileMetadata(t *testing.T) {
-	_, err := sessions.NewP2PShare(sessions.CreateP2PShareInput{
-		OwnerAgentID:  "agent_1",
-		FileName:      "",
-		FileSizeBytes: 42,
-		Now:           time.Now(),
-	})
-	if err == nil {
-		t.Fatal("expected error for empty file name")
+func TestNewP2PShareRejectsInvalidRequiredFieldsWithTypedErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   sessions.CreateP2PShareInput
+		wantErr error
+	}{
+		{
+			name: "missing owner agent",
+			input: sessions.CreateP2PShareInput{
+				OwnerAgentID:  "",
+				FileName:      "report.pdf",
+				FileSizeBytes: 42,
+				Now:           time.Now(),
+			},
+			wantErr: sessions.ErrOwnerAgentRequired,
+		},
+		{
+			name: "missing file name",
+			input: sessions.CreateP2PShareInput{
+				OwnerAgentID:  "agent_1",
+				FileName:      "",
+				FileSizeBytes: 42,
+				Now:           time.Now(),
+			},
+			wantErr: sessions.ErrFileNameRequired,
+		},
+		{
+			name: "negative file size",
+			input: sessions.CreateP2PShareInput{
+				OwnerAgentID:  "agent_1",
+				FileName:      "report.pdf",
+				FileSizeBytes: -1,
+				Now:           time.Now(),
+			},
+			wantErr: sessions.ErrFileSizeNegative,
+		},
 	}
 
-	_, err = sessions.NewP2PShare(sessions.CreateP2PShareInput{
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := sessions.NewP2PShare(tt.input)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("NewP2PShare error = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestNewP2PShareRejectsInvalidPolicyWithTypedErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   sessions.CreateP2PShareInput
+		wantErr error
+	}{
+		{
+			name: "negative TTL",
+			input: validP2PShareInput(func(input *sessions.CreateP2PShareInput) {
+				input.TTL = -time.Second
+			}),
+			wantErr: sessions.ErrTTLNotPositive,
+		},
+		{
+			name: "negative max downloads",
+			input: validP2PShareInput(func(input *sessions.CreateP2PShareInput) {
+				input.MaxDownloads = -1
+			}),
+			wantErr: sessions.ErrMaxDownloadsNotPositive,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := sessions.NewP2PShare(tt.input)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("NewP2PShare error = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func validP2PShareInput(mutate func(*sessions.CreateP2PShareInput)) sessions.CreateP2PShareInput {
+	input := sessions.CreateP2PShareInput{
 		OwnerAgentID:  "agent_1",
 		FileName:      "report.pdf",
-		FileSizeBytes: -1,
-		Now:           time.Now(),
-	})
-	if err == nil {
-		t.Fatal("expected error for negative file size")
+		FileSizeBytes: 42,
+		Now:           time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC),
 	}
+	if mutate != nil {
+		mutate(&input)
+	}
+	return input
 }
