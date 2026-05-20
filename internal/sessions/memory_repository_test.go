@@ -13,37 +13,37 @@ import (
 func TestMemoryRepositorySaveGetListAndUpdate(t *testing.T) {
 	repo := sessions.NewMemoryRepository()
 	ctx := context.Background()
-	session := mustNewP2PShare(t)
-	session.ID = "share_1"
+	transfer := mustNewTransferIntent(t)
+	transfer.ID = "transfer_1"
 
-	if err := repo.Save(ctx, session); err != nil {
+	if err := repo.Save(ctx, transfer); err != nil {
 		t.Fatalf("Save returned error: %v", err)
 	}
 
-	got, err := repo.Get(ctx, session.ID)
+	got, err := repo.Get(ctx, transfer.ID)
 	if err != nil {
 		t.Fatalf("Get returned error: %v", err)
 	}
-	if got.ID != session.ID {
-		t.Fatalf("Get ID = %q, want %q", got.ID, session.ID)
+	if got.ID != transfer.ID {
+		t.Fatalf("Get ID = %q, want %q", got.ID, transfer.ID)
 	}
 
-	updated, err := repo.Update(ctx, session.ID, func(s *sessions.TransferSession) error {
-		return s.MarkSenderReady()
+	updated, err := repo.Update(ctx, transfer.ID, func(s *sessions.TransferSession) error {
+		return s.MarkOffered()
 	})
 	if err != nil {
 		t.Fatalf("Update returned error: %v", err)
 	}
-	if updated.Status != sessions.StatusWaitingReceiver {
-		t.Fatalf("updated status = %q, want %q", updated.Status, sessions.StatusWaitingReceiver)
+	if updated.Status != sessions.StatusOffered {
+		t.Fatalf("updated status = %q, want %q", updated.Status, sessions.StatusOffered)
 	}
 
 	active, err := repo.ListActive(ctx)
 	if err != nil {
 		t.Fatalf("ListActive returned error: %v", err)
 	}
-	if len(active) != 1 || active[0].ID != session.ID {
-		t.Fatalf("active = %#v, want one session %q", active, session.ID)
+	if len(active) != 1 || active[0].ID != transfer.ID {
+		t.Fatalf("active = %#v, want one transfer %q", active, transfer.ID)
 	}
 }
 
@@ -64,17 +64,17 @@ func TestMemoryRepositoryReturnsNotFoundForUnknownSession(t *testing.T) {
 func TestMemoryRepositoryUsesDefensiveCopies(t *testing.T) {
 	repo := sessions.NewMemoryRepository()
 	ctx := context.Background()
-	session := mustNewP2PShare(t)
-	session.ID = "share_1"
+	transfer := mustNewTransferIntent(t)
+	transfer.ID = "transfer_1"
 	passwordHash := "stored_hash"
-	session.PasswordHash = &passwordHash
+	transfer.PasswordHash = &passwordHash
 
-	if err := repo.Save(ctx, session); err != nil {
+	if err := repo.Save(ctx, transfer); err != nil {
 		t.Fatalf("Save returned error: %v", err)
 	}
 	passwordHash = "mutated_after_save"
 
-	got, err := repo.Get(ctx, session.ID)
+	got, err := repo.Get(ctx, transfer.ID)
 	if err != nil {
 		t.Fatalf("Get returned error: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestMemoryRepositoryUsesDefensiveCopies(t *testing.T) {
 	}
 
 	*got.PasswordHash = "mutated_after_get"
-	again, err := repo.Get(ctx, session.ID)
+	again, err := repo.Get(ctx, transfer.ID)
 	if err != nil {
 		t.Fatalf("Get again returned error: %v", err)
 	}
@@ -101,12 +101,12 @@ func TestMemoryRepositoryIsConcurrentSafe(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			session := mustNewP2PShare(t)
-			session.ID = "share_" + string(rune('A'+i))
-			if err := repo.Save(ctx, session); err != nil {
+			transfer := mustNewTransferIntent(t)
+			transfer.ID = "transfer_" + string(rune('A'+i))
+			if err := repo.Save(ctx, transfer); err != nil {
 				t.Errorf("Save returned error: %v", err)
 			}
-			_, _ = repo.Get(ctx, session.ID)
+			_, _ = repo.Get(ctx, transfer.ID)
 			_, _ = repo.ListActive(ctx)
 		}(i)
 	}
@@ -124,9 +124,9 @@ func TestMemoryRepositoryIsConcurrentSafe(t *testing.T) {
 func TestMemoryRepositoryListActiveExcludesTerminalSessions(t *testing.T) {
 	repo := sessions.NewMemoryRepository()
 	ctx := context.Background()
-	active := mustNewP2PShare(t)
+	active := mustNewTransferIntent(t)
 	active.ID = "active"
-	cancelled := mustNewP2PShare(t)
+	cancelled := mustNewTransferIntent(t)
 	cancelled.ID = "cancelled"
 	if err := cancelled.Cancel(time.Now()); err != nil {
 		t.Fatalf("Cancel returned error: %v", err)
@@ -144,6 +144,6 @@ func TestMemoryRepositoryListActiveExcludesTerminalSessions(t *testing.T) {
 		t.Fatalf("ListActive returned error: %v", err)
 	}
 	if len(got) != 1 || got[0].ID != active.ID {
-		t.Fatalf("active sessions = %#v, want only %q", got, active.ID)
+		t.Fatalf("active transfers = %#v, want only %q", got, active.ID)
 	}
 }

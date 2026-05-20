@@ -8,102 +8,164 @@ import (
 	"github.com/kirillkuzin/postamat/internal/sessions"
 )
 
-func TestTransferSessionStatusTransitionsFollowP2PLifecycle(t *testing.T) {
-	session := mustNewP2PShare(t)
+func TestTransferSessionStatusTransitionsFollowCanonicalLifecycle(t *testing.T) {
+	transfer := mustNewTransferIntent(t)
 
-	if err := session.MarkSenderReady(); err != nil {
-		t.Fatalf("MarkSenderReady returned error: %v", err)
+	if err := transfer.MarkOffered(); err != nil {
+		t.Fatalf("MarkOffered returned error: %v", err)
 	}
-	if session.Status != sessions.StatusWaitingReceiver {
-		t.Fatalf("Status after sender ready = %q, want %q", session.Status, sessions.StatusWaitingReceiver)
-	}
-
-	if err := session.MarkSignalingStarted(); err != nil {
-		t.Fatalf("MarkSignalingStarted returned error: %v", err)
-	}
-	if session.Status != sessions.StatusSignaling {
-		t.Fatalf("Status after signaling started = %q, want %q", session.Status, sessions.StatusSignaling)
+	if transfer.Status != sessions.StatusOffered {
+		t.Fatalf("Status after offered = %q, want %q", transfer.Status, sessions.StatusOffered)
 	}
 
-	if err := session.MarkConnected(); err != nil {
-		t.Fatalf("MarkConnected returned error: %v", err)
+	if err := transfer.MarkAccepted(); err != nil {
+		t.Fatalf("MarkAccepted returned error: %v", err)
 	}
-	if session.Status != sessions.StatusConnected {
-		t.Fatalf("Status after connected = %q, want %q", session.Status, sessions.StatusConnected)
+	if transfer.Status != sessions.StatusAccepted {
+		t.Fatalf("Status after accepted = %q, want %q", transfer.Status, sessions.StatusAccepted)
 	}
 
-	if err := session.MarkTransferStarted(); err != nil {
+	if err := transfer.MarkConnecting(); err != nil {
+		t.Fatalf("MarkConnecting returned error: %v", err)
+	}
+	if transfer.Status != sessions.StatusConnecting {
+		t.Fatalf("Status after connecting = %q, want %q", transfer.Status, sessions.StatusConnecting)
+	}
+
+	if err := transfer.MarkTransferStarted(); err != nil {
 		t.Fatalf("MarkTransferStarted returned error: %v", err)
 	}
-	if session.Status != sessions.StatusTransferring {
-		t.Fatalf("Status after transfer started = %q, want %q", session.Status, sessions.StatusTransferring)
+	if transfer.Status != sessions.StatusTransferring {
+		t.Fatalf("Status after transfer started = %q, want %q", transfer.Status, sessions.StatusTransferring)
 	}
 
 	completedAt := time.Date(2026, 5, 19, 12, 30, 0, 0, time.UTC)
-	if err := session.MarkCompleted(completedAt); err != nil {
+	if err := transfer.MarkCompleted(completedAt); err != nil {
 		t.Fatalf("MarkCompleted returned error: %v", err)
 	}
-	if session.Status != sessions.StatusCompleted {
-		t.Fatalf("Status after completed = %q, want %q", session.Status, sessions.StatusCompleted)
+	if transfer.Status != sessions.StatusCompleted {
+		t.Fatalf("Status after completed = %q, want %q", transfer.Status, sessions.StatusCompleted)
 	}
-	if session.DownloadCount != 1 {
-		t.Fatalf("DownloadCount = %d, want 1", session.DownloadCount)
+	if transfer.DownloadCount != 1 {
+		t.Fatalf("DownloadCount = %d, want 1", transfer.DownloadCount)
 	}
-	if session.CompletedAt == nil || !session.CompletedAt.Equal(completedAt) {
-		t.Fatalf("CompletedAt = %v, want %v", session.CompletedAt, completedAt)
+	if transfer.CompletedAt == nil || !transfer.CompletedAt.Equal(completedAt) {
+		t.Fatalf("CompletedAt = %v, want %v", transfer.CompletedAt, completedAt)
 	}
 }
 
 func TestTransferSessionRejectsInvalidStatusTransition(t *testing.T) {
-	session := mustNewP2PShare(t)
+	transfer := mustNewTransferIntent(t)
 
-	err := session.MarkConnected()
+	err := transfer.MarkConnecting()
 	if !errors.Is(err, sessions.ErrInvalidStatusTransition) {
-		t.Fatalf("MarkConnected error = %v, want %v", err, sessions.ErrInvalidStatusTransition)
+		t.Fatalf("MarkConnecting error = %v, want %v", err, sessions.ErrInvalidStatusTransition)
 	}
-	if session.Status != sessions.StatusWaitingSender {
-		t.Fatalf("Status changed to %q, want %q", session.Status, sessions.StatusWaitingSender)
+	if transfer.Status != sessions.StatusCreated {
+		t.Fatalf("Status changed to %q, want %q", transfer.Status, sessions.StatusCreated)
 	}
 }
 
-func TestTransferSessionCancelMovesNonTerminalSessionToCancelled(t *testing.T) {
-	session := mustNewP2PShare(t)
-	cancelledAt := time.Date(2026, 5, 19, 12, 10, 0, 0, time.UTC)
+func TestTransferSessionCanFailFromConnectingOrTransferring(t *testing.T) {
+	for _, start := range []struct {
+		name string
+		move func(*sessions.TransferSession) error
+	}{
+		{
+			name: "connecting",
+			move: func(transfer *sessions.TransferSession) error {
+				if err := transfer.MarkOffered(); err != nil {
+					return err
+				}
+				if err := transfer.MarkAccepted(); err != nil {
+					return err
+				}
+				return transfer.MarkConnecting()
+			},
+		},
+		{
+			name: "transferring",
+			move: func(transfer *sessions.TransferSession) error {
+				if err := transfer.MarkOffered(); err != nil {
+					return err
+				}
+				if err := transfer.MarkAccepted(); err != nil {
+					return err
+				}
+				if err := transfer.MarkConnecting(); err != nil {
+					return err
+				}
+				return transfer.MarkTransferStarted()
+			},
+		},
+	} {
+		t.Run(start.name, func(t *testing.T) {
+			transfer := mustNewTransferIntent(t)
+			if err := start.move(&transfer); err != nil {
+				t.Fatalf("move to %s returned error: %v", start.name, err)
+			}
+			failedAt := time.Date(2026, 5, 19, 12, 20, 0, 0, time.UTC)
 
-	if err := session.Cancel(cancelledAt); err != nil {
+			if err := transfer.MarkFailed("agentd disconnected", failedAt); err != nil {
+				t.Fatalf("MarkFailed returned error: %v", err)
+			}
+			if transfer.Status != sessions.StatusFailed {
+				t.Fatalf("Status = %q, want %q", transfer.Status, sessions.StatusFailed)
+			}
+			if transfer.FailureReason != "agentd disconnected" {
+				t.Fatalf("FailureReason = %q, want agentd disconnected", transfer.FailureReason)
+			}
+			if transfer.FailedAt == nil || !transfer.FailedAt.Equal(failedAt) {
+				t.Fatalf("FailedAt = %v, want %v", transfer.FailedAt, failedAt)
+			}
+		})
+	}
+}
+
+func TestTransferSessionCancelAndExpireMoveNonTerminalSessionToTerminalState(t *testing.T) {
+	cancelled := mustNewTransferIntent(t)
+	cancelledAt := time.Date(2026, 5, 19, 12, 10, 0, 0, time.UTC)
+	if err := cancelled.Cancel(cancelledAt); err != nil {
 		t.Fatalf("Cancel returned error: %v", err)
 	}
-	if session.Status != sessions.StatusCancelled {
-		t.Fatalf("Status = %q, want %q", session.Status, sessions.StatusCancelled)
+	if cancelled.Status != sessions.StatusCancelled {
+		t.Fatalf("cancelled status = %q, want %q", cancelled.Status, sessions.StatusCancelled)
 	}
-	if session.CancelledAt == nil || !session.CancelledAt.Equal(cancelledAt) {
-		t.Fatalf("CancelledAt = %v, want %v", session.CancelledAt, cancelledAt)
+	if cancelled.CancelledAt == nil || !cancelled.CancelledAt.Equal(cancelledAt) {
+		t.Fatalf("CancelledAt = %v, want %v", cancelled.CancelledAt, cancelledAt)
+	}
+
+	expired := mustNewTransferIntent(t)
+	expiredAt := time.Date(2026, 5, 19, 12, 31, 0, 0, time.UTC)
+	if err := expired.Expire(expiredAt); err != nil {
+		t.Fatalf("Expire returned error: %v", err)
+	}
+	if expired.Status != sessions.StatusExpired {
+		t.Fatalf("expired status = %q, want %q", expired.Status, sessions.StatusExpired)
+	}
+	if expired.ExpiredAt == nil || !expired.ExpiredAt.Equal(expiredAt) {
+		t.Fatalf("ExpiredAt = %v, want %v", expired.ExpiredAt, expiredAt)
 	}
 }
 
 func TestTransferSessionTerminalSessionsCannotTransition(t *testing.T) {
-	session := mustNewP2PShare(t)
-	if err := session.Cancel(time.Now()); err != nil {
-		t.Fatalf("Cancel returned error: %v", err)
+	transfer := mustNewTransferIntent(t)
+	if err := transfer.MarkFailed("agentd disconnected", time.Now()); err != nil {
+		t.Fatalf("MarkFailed returned error: %v", err)
 	}
 
-	err := session.MarkSenderReady()
+	err := transfer.MarkOffered()
 	if !errors.Is(err, sessions.ErrTerminalSession) {
-		t.Fatalf("MarkSenderReady error = %v, want %v", err, sessions.ErrTerminalSession)
+		t.Fatalf("MarkOffered error = %v, want %v", err, sessions.ErrTerminalSession)
 	}
 }
 
-func mustNewP2PShare(t *testing.T) sessions.TransferSession {
+func mustNewTransferIntent(t *testing.T) sessions.TransferSession {
 	t.Helper()
 
-	session, err := sessions.NewP2PShare(sessions.CreateP2PShareInput{
-		OwnerAgentID:  "agent_1",
-		FileName:      "report.pdf",
-		FileSizeBytes: 42,
-		Now:           time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC),
-	})
+	transfer, err := sessions.NewTransferIntent(validTransferInput(nil))
 	if err != nil {
-		t.Fatalf("NewP2PShare returned error: %v", err)
+		t.Fatalf("NewTransferIntent returned error: %v", err)
 	}
-	return session
+	return transfer
 }

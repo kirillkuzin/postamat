@@ -8,95 +8,137 @@ import (
 	"github.com/kirillkuzin/postamat/internal/sessions"
 )
 
-func TestNewP2PShareAppliesSafeDefaults(t *testing.T) {
-	share, err := sessions.NewP2PShare(sessions.CreateP2PShareInput{
-		OwnerAgentID:  "agent_1",
+func TestNewTransferIntentCreatesAgentTargetWithSafeDefaults(t *testing.T) {
+	transfer, err := sessions.NewTransferIntent(sessions.CreateTransferInput{
+		FromAgentID:   "agent_a",
+		ToAgentID:     "agent_b",
+		Target:        sessions.TargetAgent,
 		FileName:      "report.pdf",
 		FileSizeBytes: 42,
 		Now:           time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC),
 	})
-
 	if err != nil {
-		t.Fatalf("NewP2PShare returned error: %v", err)
+		t.Fatalf("NewTransferIntent returned error: %v", err)
 	}
-	if share.Transport != sessions.TransportWebRTCP2P {
-		t.Fatalf("Transport = %q, want %q", share.Transport, sessions.TransportWebRTCP2P)
+	if transfer.Transport != sessions.TransportWebRTCP2P {
+		t.Fatalf("Transport = %q, want %q", transfer.Transport, sessions.TransportWebRTCP2P)
 	}
-	if share.Status != sessions.StatusWaitingSender {
-		t.Fatalf("Status = %q, want %q", share.Status, sessions.StatusWaitingSender)
+	if transfer.Target != sessions.TargetAgent {
+		t.Fatalf("Target = %q, want %q", transfer.Target, sessions.TargetAgent)
 	}
-	if share.MaxDownloads != 1 {
-		t.Fatalf("MaxDownloads = %d, want 1", share.MaxDownloads)
+	if transfer.Status != sessions.StatusCreated {
+		t.Fatalf("Status = %q, want %q", transfer.Status, sessions.StatusCreated)
 	}
-	if got, want := share.ExpiresAt.Sub(share.CreatedAt), 30*time.Minute; got != want {
+	if transfer.FromAgentID != "agent_a" || transfer.ToAgentID != "agent_b" {
+		t.Fatalf("agents = from %q to %q, want agent_a to agent_b", transfer.FromAgentID, transfer.ToAgentID)
+	}
+	if got, want := transfer.ExpiresAt.Sub(transfer.CreatedAt), 30*time.Minute; got != want {
 		t.Fatalf("TTL = %s, want %s", got, want)
+	}
+	if transfer.MaxDownloads != 1 {
+		t.Fatalf("MaxDownloads = %d, want 1", transfer.MaxDownloads)
 	}
 }
 
-func TestNewP2PShareRejectsInvalidRequiredFieldsWithTypedErrors(t *testing.T) {
+func TestNewTransferIntentCreatesBrowserLinkTarget(t *testing.T) {
+	transfer, err := sessions.NewTransferIntent(sessions.CreateTransferInput{
+		FromAgentID:   "agent_a",
+		Target:        sessions.TargetBrowserLink,
+		FileName:      "report.pdf",
+		FileSizeBytes: 42,
+		Now:           time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("NewTransferIntent returned error: %v", err)
+	}
+	if transfer.Target != sessions.TargetBrowserLink {
+		t.Fatalf("Target = %q, want %q", transfer.Target, sessions.TargetBrowserLink)
+	}
+	if transfer.ToAgentID != "" {
+		t.Fatalf("ToAgentID = %q, want empty for browser link", transfer.ToAgentID)
+	}
+}
+
+func TestNewTransferIntentRejectsInvalidRequiredFieldsWithTypedErrors(t *testing.T) {
 	tests := []struct {
 		name    string
-		input   sessions.CreateP2PShareInput
+		input   sessions.CreateTransferInput
 		wantErr error
 	}{
 		{
-			name: "missing owner agent",
-			input: sessions.CreateP2PShareInput{
-				OwnerAgentID:  "",
+			name: "missing from agent",
+			input: sessions.CreateTransferInput{
+				FromAgentID:   "",
+				ToAgentID:     "agent_b",
+				Target:        sessions.TargetAgent,
 				FileName:      "report.pdf",
 				FileSizeBytes: 42,
-				Now:           time.Now(),
 			},
-			wantErr: sessions.ErrOwnerAgentRequired,
+			wantErr: sessions.ErrFromAgentRequired,
+		},
+		{
+			name: "missing target",
+			input: validTransferInput(func(input *sessions.CreateTransferInput) {
+				input.Target = ""
+			}),
+			wantErr: sessions.ErrTargetRequired,
+		},
+		{
+			name: "unsupported target",
+			input: validTransferInput(func(input *sessions.CreateTransferInput) {
+				input.Target = "fax"
+			}),
+			wantErr: sessions.ErrUnsupportedTarget,
+		},
+		{
+			name: "agent target missing to agent",
+			input: validTransferInput(func(input *sessions.CreateTransferInput) {
+				input.ToAgentID = ""
+			}),
+			wantErr: sessions.ErrTargetAgentRequired,
 		},
 		{
 			name: "missing file name",
-			input: sessions.CreateP2PShareInput{
-				OwnerAgentID:  "agent_1",
-				FileName:      "",
-				FileSizeBytes: 42,
-				Now:           time.Now(),
-			},
+			input: validTransferInput(func(input *sessions.CreateTransferInput) {
+				input.FileName = ""
+			}),
 			wantErr: sessions.ErrFileNameRequired,
 		},
 		{
 			name: "negative file size",
-			input: sessions.CreateP2PShareInput{
-				OwnerAgentID:  "agent_1",
-				FileName:      "report.pdf",
-				FileSizeBytes: -1,
-				Now:           time.Now(),
-			},
+			input: validTransferInput(func(input *sessions.CreateTransferInput) {
+				input.FileSizeBytes = -1
+			}),
 			wantErr: sessions.ErrFileSizeNegative,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := sessions.NewP2PShare(tt.input)
+			_, err := sessions.NewTransferIntent(tt.input)
 			if !errors.Is(err, tt.wantErr) {
-				t.Fatalf("NewP2PShare error = %v, want %v", err, tt.wantErr)
+				t.Fatalf("NewTransferIntent error = %v, want %v", err, tt.wantErr)
 			}
 		})
 	}
 }
 
-func TestNewP2PShareRejectsInvalidPolicyWithTypedErrors(t *testing.T) {
+func TestNewTransferIntentRejectsInvalidPolicyWithTypedErrors(t *testing.T) {
 	tests := []struct {
 		name    string
-		input   sessions.CreateP2PShareInput
+		input   sessions.CreateTransferInput
 		wantErr error
 	}{
 		{
 			name: "negative TTL",
-			input: validP2PShareInput(func(input *sessions.CreateP2PShareInput) {
+			input: validTransferInput(func(input *sessions.CreateTransferInput) {
 				input.TTL = -time.Second
 			}),
 			wantErr: sessions.ErrTTLNotPositive,
 		},
 		{
 			name: "negative max downloads",
-			input: validP2PShareInput(func(input *sessions.CreateP2PShareInput) {
+			input: validTransferInput(func(input *sessions.CreateTransferInput) {
 				input.MaxDownloads = -1
 			}),
 			wantErr: sessions.ErrMaxDownloadsNotPositive,
@@ -105,17 +147,19 @@ func TestNewP2PShareRejectsInvalidPolicyWithTypedErrors(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := sessions.NewP2PShare(tt.input)
+			_, err := sessions.NewTransferIntent(tt.input)
 			if !errors.Is(err, tt.wantErr) {
-				t.Fatalf("NewP2PShare error = %v, want %v", err, tt.wantErr)
+				t.Fatalf("NewTransferIntent error = %v, want %v", err, tt.wantErr)
 			}
 		})
 	}
 }
 
-func validP2PShareInput(mutate func(*sessions.CreateP2PShareInput)) sessions.CreateP2PShareInput {
-	input := sessions.CreateP2PShareInput{
-		OwnerAgentID:  "agent_1",
+func validTransferInput(mutate func(*sessions.CreateTransferInput)) sessions.CreateTransferInput {
+	input := sessions.CreateTransferInput{
+		FromAgentID:   "agent_a",
+		ToAgentID:     "agent_b",
+		Target:        sessions.TargetAgent,
 		FileName:      "report.pdf",
 		FileSizeBytes: 42,
 		Now:           time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC),

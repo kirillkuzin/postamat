@@ -10,63 +10,77 @@ import (
 	"github.com/kirillkuzin/postamat/internal/sessions"
 )
 
-func TestServiceCreateP2PShareGeneratesIdentifiersAndTickets(t *testing.T) {
+func TestServiceCreateTransferGeneratesIdentifiersAndTickets(t *testing.T) {
 	service := newTestService()
 
-	created, err := service.CreateP2PShare(context.Background(), sessions.CreateP2PShareInput{
-		OwnerAgentID:  "agent_1",
-		FileName:      "report.pdf",
-		FileSizeBytes: 42,
-	})
+	created, err := service.CreateTransfer(context.Background(), validTransferInput(nil))
 	if err != nil {
-		t.Fatalf("CreateP2PShare returned error: %v", err)
+		t.Fatalf("CreateTransfer returned error: %v", err)
 	}
-	if created.Share.ID != "share_1" {
-		t.Fatalf("Share.ID = %q, want share_1", created.Share.ID)
+	if created.Transfer.ID != "transfer_1" {
+		t.Fatalf("Transfer.ID = %q, want transfer_1", created.Transfer.ID)
+	}
+	if created.AgentTicket != "agent_ticket_1" {
+		t.Fatalf("AgentTicket = %q, want agent_ticket_1", created.AgentTicket)
+	}
+	if created.Transfer.AgentTicketHash != "agent_ticket_hash_1" {
+		t.Fatalf("AgentTicketHash = %q, want agent_ticket_hash_1", created.Transfer.AgentTicketHash)
+	}
+	if created.PublicToken != "" {
+		t.Fatalf("PublicToken = %q, want empty for agent target", created.PublicToken)
+	}
+	if created.Transfer.Status != sessions.StatusCreated {
+		t.Fatalf("Status = %q, want %q", created.Transfer.Status, sessions.StatusCreated)
+	}
+}
+
+func TestServiceCreateBrowserLinkTransferGeneratesPublicToken(t *testing.T) {
+	service := newTestService()
+
+	created, err := service.CreateTransfer(context.Background(), validTransferInput(func(input *sessions.CreateTransferInput) {
+		input.Target = sessions.TargetBrowserLink
+		input.ToAgentID = ""
+	}))
+	if err != nil {
+		t.Fatalf("CreateTransfer returned error: %v", err)
 	}
 	if created.PublicToken != "public_token_1" {
 		t.Fatalf("PublicToken = %q, want public_token_1", created.PublicToken)
 	}
-	if created.SenderTicket != "sender_ticket_1" {
-		t.Fatalf("SenderTicket = %q, want sender_ticket_1", created.SenderTicket)
-	}
-	if created.Share.PublicTokenHash != "public_token_hash_1" {
-		t.Fatalf("PublicTokenHash = %q, want public_token_hash_1", created.Share.PublicTokenHash)
-	}
-	if created.Share.Status != sessions.StatusWaitingSender {
-		t.Fatalf("Status = %q, want %q", created.Share.Status, sessions.StatusWaitingSender)
+	if created.Transfer.PublicTokenHash != "public_token_hash_1" {
+		t.Fatalf("PublicTokenHash = %q, want public_token_hash_1", created.Transfer.PublicTokenHash)
 	}
 }
 
-func TestServiceGetReturnsExistingShare(t *testing.T) {
+func TestServiceGetReturnsExistingTransfer(t *testing.T) {
 	service := newTestService()
-	created, err := service.CreateP2PShare(context.Background(), validP2PShareInput(nil))
+	created, err := service.CreateTransfer(context.Background(), validTransferInput(nil))
 	if err != nil {
-		t.Fatalf("CreateP2PShare returned error: %v", err)
+		t.Fatalf("CreateTransfer returned error: %v", err)
 	}
 
-	got, err := service.Get(context.Background(), created.Share.ID)
+	got, err := service.Get(context.Background(), created.Transfer.ID)
 	if err != nil {
 		t.Fatalf("Get returned error: %v", err)
 	}
-	if got.ID != created.Share.ID {
-		t.Fatalf("Get ID = %q, want %q", got.ID, created.Share.ID)
+	if got.ID != created.Transfer.ID {
+		t.Fatalf("Get ID = %q, want %q", got.ID, created.Transfer.ID)
 	}
 }
 
-func TestServiceListActiveExcludesTerminalSessions(t *testing.T) {
+func TestServiceListActiveExcludesTerminalTransfers(t *testing.T) {
 	service := newTestService()
-	first, err := service.CreateP2PShare(context.Background(), validP2PShareInput(nil))
+	first, err := service.CreateTransfer(context.Background(), validTransferInput(nil))
 	if err != nil {
-		t.Fatalf("CreateP2PShare first returned error: %v", err)
+		t.Fatalf("CreateTransfer first returned error: %v", err)
 	}
-	second, err := service.CreateP2PShare(context.Background(), validP2PShareInput(func(input *sessions.CreateP2PShareInput) {
+	second, err := service.CreateTransfer(context.Background(), validTransferInput(func(input *sessions.CreateTransferInput) {
 		input.FileName = "second.pdf"
 	}))
 	if err != nil {
-		t.Fatalf("CreateP2PShare second returned error: %v", err)
+		t.Fatalf("CreateTransfer second returned error: %v", err)
 	}
-	if _, err := service.Cancel(context.Background(), first.Share.ID); err != nil {
+	if _, err := service.Cancel(context.Background(), first.Transfer.ID); err != nil {
 		t.Fatalf("Cancel returned error: %v", err)
 	}
 
@@ -74,19 +88,52 @@ func TestServiceListActiveExcludesTerminalSessions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListActive returned error: %v", err)
 	}
-	if len(active) != 1 || active[0].ID != second.Share.ID {
-		t.Fatalf("active shares = %#v, want only %q", active, second.Share.ID)
+	if len(active) != 1 || active[0].ID != second.Transfer.ID {
+		t.Fatalf("active transfers = %#v, want only %q", active, second.Transfer.ID)
+	}
+}
+
+func TestServiceCanMarkFailedAndExpired(t *testing.T) {
+	service := newTestService()
+	created, err := service.CreateTransfer(context.Background(), validTransferInput(nil))
+	if err != nil {
+		t.Fatalf("CreateTransfer returned error: %v", err)
+	}
+
+	failed, err := service.MarkFailed(context.Background(), created.Transfer.ID, "agentd disconnected")
+	if err != nil {
+		t.Fatalf("MarkFailed returned error: %v", err)
+	}
+	if failed.Status != sessions.StatusFailed {
+		t.Fatalf("failed status = %q, want %q", failed.Status, sessions.StatusFailed)
+	}
+	if failed.FailureReason != "agentd disconnected" {
+		t.Fatalf("FailureReason = %q, want agentd disconnected", failed.FailureReason)
+	}
+
+	expiring, err := service.CreateTransfer(context.Background(), validTransferInput(func(input *sessions.CreateTransferInput) {
+		input.FileName = "expire.pdf"
+	}))
+	if err != nil {
+		t.Fatalf("CreateTransfer expiring returned error: %v", err)
+	}
+	expired, err := service.Expire(context.Background(), expiring.Transfer.ID)
+	if err != nil {
+		t.Fatalf("Expire returned error: %v", err)
+	}
+	if expired.Status != sessions.StatusExpired {
+		t.Fatalf("expired status = %q, want %q", expired.Status, sessions.StatusExpired)
 	}
 }
 
 func TestServiceCancelChangesStatus(t *testing.T) {
 	service := newTestService()
-	created, err := service.CreateP2PShare(context.Background(), validP2PShareInput(nil))
+	created, err := service.CreateTransfer(context.Background(), validTransferInput(nil))
 	if err != nil {
-		t.Fatalf("CreateP2PShare returned error: %v", err)
+		t.Fatalf("CreateTransfer returned error: %v", err)
 	}
 
-	cancelled, err := service.Cancel(context.Background(), created.Share.ID)
+	cancelled, err := service.Cancel(context.Background(), created.Transfer.ID)
 	if err != nil {
 		t.Fatalf("Cancel returned error: %v", err)
 	}
@@ -120,12 +167,12 @@ func TestDefaultTokenIssuerDoesNotStoreRawToken(t *testing.T) {
 		t.Fatalf("stored public token %q must not contain raw token %q", publicToken.Stored, publicToken.Raw)
 	}
 
-	senderTicket := issuer.NewSenderTicket()
-	if senderTicket.Raw == "" || senderTicket.Stored == "" {
-		t.Fatalf("sender ticket fields must be non-empty: %#v", senderTicket)
+	agentTicket := issuer.NewAgentTicket()
+	if agentTicket.Raw == "" || agentTicket.Stored == "" {
+		t.Fatalf("agent ticket fields must be non-empty: %#v", agentTicket)
 	}
-	if strings.Contains(senderTicket.Stored, senderTicket.Raw) {
-		t.Fatalf("stored sender ticket %q must not contain raw ticket %q", senderTicket.Stored, senderTicket.Raw)
+	if strings.Contains(agentTicket.Stored, agentTicket.Raw) {
+		t.Fatalf("stored agent ticket %q must not contain raw ticket %q", agentTicket.Stored, agentTicket.Raw)
 	}
 }
 
@@ -136,14 +183,14 @@ func newTestService() *sessions.Service {
 }
 
 type fakeTokenIssuer struct {
-	shareID int
-	public  int
-	sender  int
+	transferID int
+	public     int
+	agent      int
 }
 
-func (f *fakeTokenIssuer) NewShareID() string {
-	f.shareID++
-	return "share_" + string(rune('0'+f.shareID))
+func (f *fakeTokenIssuer) NewTransferID() string {
+	f.transferID++
+	return "transfer_" + string(rune('0'+f.transferID))
 }
 
 func (f *fakeTokenIssuer) NewPublicToken() sessions.StoredToken {
@@ -154,10 +201,10 @@ func (f *fakeTokenIssuer) NewPublicToken() sessions.StoredToken {
 	}
 }
 
-func (f *fakeTokenIssuer) NewSenderTicket() sessions.StoredToken {
-	f.sender++
+func (f *fakeTokenIssuer) NewAgentTicket() sessions.StoredToken {
+	f.agent++
 	return sessions.StoredToken{
-		Raw:    "sender_ticket_" + string(rune('0'+f.sender)),
-		Stored: "sender_ticket_hash_" + string(rune('0'+f.sender)),
+		Raw:    "agent_ticket_" + string(rune('0'+f.agent)),
+		Stored: "agent_ticket_hash_" + string(rune('0'+f.agent)),
 	}
 }
