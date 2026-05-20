@@ -8,6 +8,10 @@ bin/
 web/recipient/dist/
 web/recipient/node_modules/
 
+# Test coverage artifacts
+coverage.out
+coverage.txt
+
 # Local environment
 .env
 .env.*

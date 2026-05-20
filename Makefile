@@ -1,6 +1,6 @@
 SHELL := /usr/bin/env bash
 
-.PHONY: verify frontend-install frontend-build gofmt-check go-test go-race go-vet go-build
+.PHONY: verify frontend-install frontend-build gofmt-check go-test go-coverage go-race go-vet go-build
 .NOTPARALLEL: verify
 
 verify: go-build
@@ -21,7 +21,11 @@ gofmt-check: frontend-build
 go-test: gofmt-check
 	go test ./...
 
-go-race: go-test
+go-coverage: go-test
+	go test -covermode=atomic -coverprofile=coverage.out ./...
+	go tool cover -func=coverage.out | tee coverage.txt
+
+go-race: go-coverage
 	go test -race ./internal/agentd ./internal/auth ./internal/agents ./internal/sessions ./internal/api ./internal/audit ./internal/db ./internal/signaling
 
 go-vet: go-race

@@ -29,7 +29,7 @@ func TestGeneratedRecipientAssetsAreIgnored(t *testing.T) {
 		t.Fatalf("read .gitignore: %v", err)
 	}
 	ignore := string(data)
-	for _, want := range []string{"web/recipient/dist/", "web/recipient/node_modules/"} {
+	for _, want := range []string{"web/recipient/dist/", "web/recipient/node_modules/", "coverage.out", "coverage.txt"} {
 		if !strings.Contains(ignore, want) {
 			t.Fatalf(".gitignore must contain %q", want)
 		}
@@ -47,6 +47,8 @@ func TestMakeVerifyBuildsFrontendBeforeGoChecks(t *testing.T) {
 		"cd web/recipient && npm run build",
 		"gofmt",
 		"go test ./...",
+		"go test -covermode=atomic -coverprofile=coverage.out ./...",
+		"go tool cover -func=coverage.out | tee coverage.txt",
 		"go vet ./...",
 		"go build ./cmd/server ./cmd/agentd ./cmd/postamat",
 	)
@@ -64,6 +66,8 @@ func TestGitHubActionsBuildsFrontendBeforeGoChecks(t *testing.T) {
 		"npm run build",
 		"gofmt",
 		"go test ./...",
+		"go test -covermode=atomic -coverprofile=coverage.out ./...",
+		"go tool cover -func=coverage.out | tee coverage.txt",
 		"go vet ./...",
 		"go build ./cmd/server ./cmd/agentd ./cmd/postamat",
 	)
