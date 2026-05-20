@@ -1,2 +1,14 @@
 # Project documents live outside git (Obsidian)
 docs/
+
+# Build artifacts
+bin/
+
+# Recipient frontend generated assets and dependencies
+web/recipient/dist/
+web/recipient/node_modules/
+
+# Local environment
+.env
+.env.*
+!.env.example
