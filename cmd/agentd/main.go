@@ -8,7 +8,7 @@ import (
 )
 
 func main() {
-	if err := app.Run(context.Background(), app.Options{Name: "senderd"}); err != nil {
+	if err := app.Run(context.Background(), app.Options{Name: "agentd"}); err != nil {
 		log.Fatal(err)
 	}
 }

@@ -18,7 +18,7 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	switch opts.Name {
-	case "server", "senderd", "cli":
+	case "server", "agentd", "cli":
 		return nil
 	case "":
 		return errors.New("command name is required")
