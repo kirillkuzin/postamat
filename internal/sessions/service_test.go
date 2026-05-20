@@ -156,8 +156,9 @@ func TestServiceUnknownIDReturnsNotFound(t *testing.T) {
 	}
 }
 
-func TestDefaultTokenIssuerDoesNotStoreRawToken(t *testing.T) {
-	issuer := sessions.RandomTokenIssuer{}
+func TestDefaultTokenIssuerDoesNotStoreRawTokenAndUsesPepper(t *testing.T) {
+	issuer := sessions.RandomTokenIssuer{Pepper: "pepper-one"}
+	otherIssuer := sessions.RandomTokenIssuer{Pepper: "pepper-two"}
 
 	publicToken := issuer.NewPublicToken()
 	if publicToken.Raw == "" || publicToken.Stored == "" {
@@ -165,6 +166,9 @@ func TestDefaultTokenIssuerDoesNotStoreRawToken(t *testing.T) {
 	}
 	if strings.Contains(publicToken.Stored, publicToken.Raw) {
 		t.Fatalf("stored public token %q must not contain raw token %q", publicToken.Stored, publicToken.Raw)
+	}
+	if sameRawWithOtherPepper := otherIssuer.StorePublicToken(publicToken.Raw); sameRawWithOtherPepper == publicToken.Stored {
+		t.Fatal("stored public token hash should depend on pepper")
 	}
 
 	agentTicket := issuer.NewAgentTicket()

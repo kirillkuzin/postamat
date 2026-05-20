@@ -2,11 +2,10 @@ package sessions
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"time"
+
+	"github.com/kirillkuzin/postamat/internal/auth"
 )
 
 type StoredToken struct {
@@ -99,31 +98,49 @@ func (s *Service) Expire(ctx context.Context, id string) (TransferSession, error
 	})
 }
 
-type RandomTokenIssuer struct{}
+type RandomTokenIssuer struct {
+	Pepper string
+}
 
 func (RandomTokenIssuer) NewTransferID() string {
-	return "tr_" + randomHex(16)
-}
-
-func (RandomTokenIssuer) NewPublicToken() StoredToken {
-	raw := "pt_" + randomHex(32)
-	return StoredToken{Raw: raw, Stored: hashToken(raw)}
-}
-
-func (RandomTokenIssuer) NewAgentTicket() StoredToken {
-	raw := "at_" + randomHex(32)
-	return StoredToken{Raw: raw, Stored: hashToken(raw)}
-}
-
-func hashToken(raw string) string {
-	sum := sha256.Sum256([]byte(raw))
-	return "sha256:" + hex.EncodeToString(sum[:])
-}
-
-func randomHex(bytes int) string {
-	buf := make([]byte, bytes)
-	if _, err := rand.Read(buf); err != nil {
-		panic(fmt.Sprintf("generate random token: %v", err))
+	raw, err := auth.GenerateToken("tr", 16)
+	if err != nil {
+		panic(fmt.Sprintf("generate transfer id: %v", err))
 	}
-	return hex.EncodeToString(buf)
+	return raw
+}
+
+func (i RandomTokenIssuer) NewPublicToken() StoredToken {
+	raw, err := auth.GenerateToken("pt", 32)
+	if err != nil {
+		panic(fmt.Sprintf("generate public token: %v", err))
+	}
+	return StoredToken{Raw: raw, Stored: i.StorePublicToken(raw)}
+}
+
+func (i RandomTokenIssuer) StorePublicToken(raw string) string {
+	stored, err := auth.HashToken(raw, i.pepper())
+	if err != nil {
+		panic(fmt.Sprintf("hash public token: %v", err))
+	}
+	return stored
+}
+
+func (i RandomTokenIssuer) NewAgentTicket() StoredToken {
+	raw, err := auth.GenerateToken("at", 32)
+	if err != nil {
+		panic(fmt.Sprintf("generate agent ticket: %v", err))
+	}
+	stored, err := auth.HashToken(raw, i.pepper())
+	if err != nil {
+		panic(fmt.Sprintf("hash agent ticket: %v", err))
+	}
+	return StoredToken{Raw: raw, Stored: stored}
+}
+
+func (i RandomTokenIssuer) pepper() string {
+	if i.Pepper != "" {
+		return i.Pepper
+	}
+	return "postamat-development-token-pepper"
 }
