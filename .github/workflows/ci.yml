@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/recipient/package-lock.json
+
+      - name: Install recipient frontend dependencies
+        working-directory: web/recipient
+        run: npm ci --ignore-scripts
+
+      - name: Build recipient frontend
+        working-directory: web/recipient
+        run: npm run build
+
+      - name: Check Go formatting
+        run: |
+          if [ -n "$(gofmt -l ./cmd ./internal)" ]; then
+            gofmt -l ./cmd ./internal
+            echo "gofmt required"
+            exit 1
+          fi
+
+      - name: Run Go tests
+        run: go test ./...
+
+      - name: Collect Go coverage
+        run: |
+          go test -covermode=atomic -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out | tee coverage.txt
+
+      - name: Run focused Go race tests
+        run: go test -race ./internal/agentd ./internal/auth ./internal/agents ./internal/sessions ./internal/api ./internal/audit ./internal/db ./internal/signaling
+
+      - name: Run Go vet
+        run: go vet ./...
+
+      - name: Build Go commands
+        run: go build ./cmd/server ./cmd/agentd ./cmd/postamat

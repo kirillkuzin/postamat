@@ -82,6 +82,7 @@ internal/
   agentd/        local daemon runtime
   integrations/  MCP/ACP adapters
 migrations/      database migrations
+web/recipient/   browser-recipient frontend source; dist is generated and ignored
 deployments/     Docker Compose and reverse proxy config
 docs/            project documentation
 ```
@@ -93,8 +94,17 @@ Some directories are placeholders until their first tested implementation lands.
 Requirements:
 
 - Go 1.26.3 or newer compatible toolchain. Use latest stable Go and latest stable dependencies at implementation time.
+- Node.js 22 and npm for the browser-recipient frontend build.
 
-Run tests:
+Run full local verification:
+
+```bash
+make verify
+```
+
+The verify target installs and builds `web/recipient` before Go checks, matching CI.
+
+Run Go tests only:
 
 ```bash
 go test ./...
