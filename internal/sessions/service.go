@@ -15,9 +15,9 @@ type StoredToken struct {
 }
 
 type TokenIssuer interface {
-	NewShareID() string
+	NewTransferID() string
 	NewPublicToken() StoredToken
-	NewSenderTicket() StoredToken
+	NewAgentTicket() StoredToken
 }
 
 type Service struct {
@@ -26,10 +26,10 @@ type Service struct {
 	now    func() time.Time
 }
 
-type CreateP2PShareResult struct {
-	Share        TransferSession
-	PublicToken  string
-	SenderTicket string
+type CreateTransferResult struct {
+	Transfer    TransferSession
+	PublicToken string
+	AgentTicket string
 }
 
 func NewService(repo Repository, tokens TokenIssuer, now func() time.Time) *Service {
@@ -42,30 +42,35 @@ func NewService(repo Repository, tokens TokenIssuer, now func() time.Time) *Serv
 	return &Service{repo: repo, tokens: tokens, now: now}
 }
 
-func (s *Service) CreateP2PShare(ctx context.Context, input CreateP2PShareInput) (CreateP2PShareResult, error) {
+func (s *Service) CreateTransfer(ctx context.Context, input CreateTransferInput) (CreateTransferResult, error) {
 	if input.Now.IsZero() {
 		input.Now = s.now()
 	}
-	session, err := NewP2PShare(input)
+	transfer, err := NewTransferIntent(input)
 	if err != nil {
-		return CreateP2PShareResult{}, err
+		return CreateTransferResult{}, err
 	}
 
-	publicToken := s.tokens.NewPublicToken()
-	senderTicket := s.tokens.NewSenderTicket()
-	session.ID = s.tokens.NewShareID()
-	session.PublicTokenHash = publicToken.Stored
-	session.SenderTicketHash = senderTicket.Stored
+	agentTicket := s.tokens.NewAgentTicket()
+	transfer.ID = s.tokens.NewTransferID()
+	transfer.AgentTicketHash = agentTicket.Stored
 
-	if err := s.repo.Save(ctx, session); err != nil {
-		return CreateP2PShareResult{}, err
+	result := CreateTransferResult{
+		Transfer:    cloneSession(transfer),
+		AgentTicket: agentTicket.Raw,
+	}
+	if transfer.Target == TargetBrowserLink {
+		publicToken := s.tokens.NewPublicToken()
+		transfer.PublicTokenHash = publicToken.Stored
+		result.PublicToken = publicToken.Raw
+		result.Transfer = cloneSession(transfer)
 	}
 
-	return CreateP2PShareResult{
-		Share:        cloneSession(session),
-		PublicToken:  publicToken.Raw,
-		SenderTicket: senderTicket.Raw,
-	}, nil
+	if err := s.repo.Save(ctx, transfer); err != nil {
+		return CreateTransferResult{}, err
+	}
+
+	return result, nil
 }
 
 func (s *Service) Get(ctx context.Context, id string) (TransferSession, error) {
@@ -82,10 +87,22 @@ func (s *Service) Cancel(ctx context.Context, id string) (TransferSession, error
 	})
 }
 
+func (s *Service) MarkFailed(ctx context.Context, id string, reason string) (TransferSession, error) {
+	return s.repo.Update(ctx, id, func(session *TransferSession) error {
+		return session.MarkFailed(reason, s.now())
+	})
+}
+
+func (s *Service) Expire(ctx context.Context, id string) (TransferSession, error) {
+	return s.repo.Update(ctx, id, func(session *TransferSession) error {
+		return session.Expire(s.now())
+	})
+}
+
 type RandomTokenIssuer struct{}
 
-func (RandomTokenIssuer) NewShareID() string {
-	return "sh_" + randomHex(16)
+func (RandomTokenIssuer) NewTransferID() string {
+	return "tr_" + randomHex(16)
 }
 
 func (RandomTokenIssuer) NewPublicToken() StoredToken {
@@ -93,8 +110,8 @@ func (RandomTokenIssuer) NewPublicToken() StoredToken {
 	return StoredToken{Raw: raw, Stored: hashToken(raw)}
 }
 
-func (RandomTokenIssuer) NewSenderTicket() StoredToken {
-	raw := "st_" + randomHex(32)
+func (RandomTokenIssuer) NewAgentTicket() StoredToken {
+	raw := "at_" + randomHex(32)
 	return StoredToken{Raw: raw, Stored: hashToken(raw)}
 }
 

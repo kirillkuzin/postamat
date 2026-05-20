@@ -9,30 +9,41 @@ import (
 const (
 	TransportWebRTCP2P = "webrtc_p2p"
 
-	StatusWaitingSender   = "waiting_sender"
-	StatusWaitingReceiver = "waiting_receiver"
-	StatusSignaling       = "signaling"
-	StatusConnected       = "connected"
-	StatusTransferring    = "transferring"
-	StatusCompleted       = "completed"
-	StatusCancelled       = "cancelled"
+	TargetAgent       = "agent"
+	TargetBrowserLink = "browser_link"
+
+	StatusCreated      = "created"
+	StatusOffered      = "offered"
+	StatusAccepted     = "accepted"
+	StatusConnecting   = "connecting"
+	StatusTransferring = "transferring"
+	StatusCompleted    = "completed"
+	StatusFailed       = "failed"
+	StatusCancelled    = "cancelled"
+	StatusExpired      = "expired"
 )
 
 var (
-	ErrOwnerAgentRequired      = errors.New("owner agent id is required")
+	ErrFromAgentRequired       = errors.New("from agent id is required")
+	ErrTargetRequired          = errors.New("target is required")
+	ErrUnsupportedTarget       = errors.New("unsupported transfer target")
+	ErrTargetAgentRequired     = errors.New("target agent id is required")
 	ErrFileNameRequired        = errors.New("file name is required")
 	ErrFileSizeNegative        = errors.New("file size must be non-negative")
 	ErrTTLNotPositive          = errors.New("ttl must be positive")
 	ErrMaxDownloadsNotPositive = errors.New("max downloads must be positive")
+	ErrFailureReasonRequired   = errors.New("failure reason is required")
 	ErrInvalidStatusTransition = errors.New("invalid status transition")
 	ErrTerminalSession         = errors.New("terminal session cannot transition")
 	ErrSessionNotFound         = errors.New("session not found")
 )
 
-const defaultP2PTTL = 30 * time.Minute
+const defaultTransferTTL = 30 * time.Minute
 
-type CreateP2PShareInput struct {
-	OwnerAgentID  string
+type CreateTransferInput struct {
+	FromAgentID   string
+	ToAgentID     string
+	Target        string
 	FileName      string
 	FileSizeBytes int64
 	Now           time.Time
@@ -41,13 +52,14 @@ type CreateP2PShareInput struct {
 }
 
 type TransferSession struct {
-	ID               string
-	Transport        string
-	Status           string
-	OwnerAgentID     string
-	SenderAgentID    string
-	PublicTokenHash  string
-	SenderTicketHash string
+	ID              string
+	Transport       string
+	Target          string
+	Status          string
+	FromAgentID     string
+	ToAgentID       string
+	PublicTokenHash string
+	AgentTicketHash string
 
 	FileName      string
 	FileSizeBytes int64
@@ -59,14 +71,31 @@ type TransferSession struct {
 	DownloadCount int
 	PasswordHash  *string
 
-	CreatedAt   time.Time
-	CompletedAt *time.Time
-	CancelledAt *time.Time
+	CreatedAt     time.Time
+	CompletedAt   *time.Time
+	FailedAt      *time.Time
+	CancelledAt   *time.Time
+	ExpiredAt     *time.Time
+	FailureReason string
 }
 
-func NewP2PShare(input CreateP2PShareInput) (TransferSession, error) {
-	if input.OwnerAgentID == "" {
-		return TransferSession{}, ErrOwnerAgentRequired
+func NewTransferIntent(input CreateTransferInput) (TransferSession, error) {
+	if input.FromAgentID == "" {
+		return TransferSession{}, ErrFromAgentRequired
+	}
+	if input.Target == "" {
+		return TransferSession{}, ErrTargetRequired
+	}
+	switch input.Target {
+	case TargetAgent:
+		if input.ToAgentID == "" {
+			return TransferSession{}, ErrTargetAgentRequired
+		}
+	case TargetBrowserLink:
+		// Browser-link recipients are addressed by public token, not agent id.
+		input.ToAgentID = ""
+	default:
+		return TransferSession{}, ErrUnsupportedTarget
 	}
 	if input.FileName == "" {
 		return TransferSession{}, ErrFileNameRequired
@@ -82,7 +111,7 @@ func NewP2PShare(input CreateP2PShareInput) (TransferSession, error) {
 
 	ttl := input.TTL
 	if ttl == 0 {
-		ttl = defaultP2PTTL
+		ttl = defaultTransferTTL
 	}
 	if ttl < 0 {
 		return TransferSession{}, ErrTTLNotPositive
@@ -98,9 +127,10 @@ func NewP2PShare(input CreateP2PShareInput) (TransferSession, error) {
 
 	return TransferSession{
 		Transport:     TransportWebRTCP2P,
-		Status:        StatusWaitingSender,
-		OwnerAgentID:  input.OwnerAgentID,
-		SenderAgentID: input.OwnerAgentID,
+		Target:        input.Target,
+		Status:        StatusCreated,
+		FromAgentID:   input.FromAgentID,
+		ToAgentID:     input.ToAgentID,
 		FileName:      input.FileName,
 		FileSizeBytes: input.FileSizeBytes,
 		CreatedAt:     now,
@@ -109,20 +139,20 @@ func NewP2PShare(input CreateP2PShareInput) (TransferSession, error) {
 	}, nil
 }
 
-func (s *TransferSession) MarkSenderReady() error {
-	return s.transition(StatusWaitingSender, StatusWaitingReceiver)
+func (s *TransferSession) MarkOffered() error {
+	return s.transition(StatusCreated, StatusOffered)
 }
 
-func (s *TransferSession) MarkSignalingStarted() error {
-	return s.transition(StatusWaitingReceiver, StatusSignaling)
+func (s *TransferSession) MarkAccepted() error {
+	return s.transition(StatusOffered, StatusAccepted)
 }
 
-func (s *TransferSession) MarkConnected() error {
-	return s.transition(StatusSignaling, StatusConnected)
+func (s *TransferSession) MarkConnecting() error {
+	return s.transition(StatusAccepted, StatusConnecting)
 }
 
 func (s *TransferSession) MarkTransferStarted() error {
-	return s.transition(StatusConnected, StatusTransferring)
+	return s.transition(StatusConnecting, StatusTransferring)
 }
 
 func (s *TransferSession) MarkCompleted(at time.Time) error {
@@ -131,6 +161,19 @@ func (s *TransferSession) MarkCompleted(at time.Time) error {
 	}
 	s.DownloadCount++
 	s.CompletedAt = cloneTime(at)
+	return nil
+}
+
+func (s *TransferSession) MarkFailed(reason string, at time.Time) error {
+	if s.IsTerminal() {
+		return ErrTerminalSession
+	}
+	if reason == "" {
+		return ErrFailureReasonRequired
+	}
+	s.Status = StatusFailed
+	s.FailureReason = reason
+	s.FailedAt = cloneTime(at)
 	return nil
 }
 
@@ -143,8 +186,17 @@ func (s *TransferSession) Cancel(at time.Time) error {
 	return nil
 }
 
+func (s *TransferSession) Expire(at time.Time) error {
+	if s.IsTerminal() {
+		return ErrTerminalSession
+	}
+	s.Status = StatusExpired
+	s.ExpiredAt = cloneTime(at)
+	return nil
+}
+
 func (s TransferSession) IsTerminal() bool {
-	return s.Status == StatusCompleted || s.Status == StatusCancelled
+	return s.Status == StatusCompleted || s.Status == StatusFailed || s.Status == StatusCancelled || s.Status == StatusExpired
 }
 
 func (s *TransferSession) transition(from, to string) error {
@@ -167,9 +219,17 @@ func cloneSession(session TransferSession) TransferSession {
 		completedAt := *session.CompletedAt
 		session.CompletedAt = &completedAt
 	}
+	if session.FailedAt != nil {
+		failedAt := *session.FailedAt
+		session.FailedAt = &failedAt
+	}
 	if session.CancelledAt != nil {
 		cancelledAt := *session.CancelledAt
 		session.CancelledAt = &cancelledAt
+	}
+	if session.ExpiredAt != nil {
+		expiredAt := *session.ExpiredAt
+		session.ExpiredAt = &expiredAt
 	}
 	return session
 }
