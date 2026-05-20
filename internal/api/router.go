@@ -7,25 +7,47 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/kirillkuzin/postamat/internal/sessions"
+	"github.com/kirillkuzin/postamat/internal/signaling"
 )
 
 type Router struct {
-	service *sessions.Service
+	service  *sessions.Service
+	presence *signaling.PresenceRegistry
+	rooms    *signaling.RoomManager
+	upgrader websocket.Upgrader
 }
 
 func NewRouter(service *sessions.Service) http.Handler {
-	return &Router{service: service}
+	presence := signaling.NewPresenceRegistry(nil)
+	return NewRouterWithSignaling(service, presence, signaling.NewRoomManager(presence, nil))
+}
+
+func NewRouterWithSignaling(service *sessions.Service, presence *signaling.PresenceRegistry, rooms *signaling.RoomManager) http.Handler {
+	if presence == nil {
+		presence = signaling.NewPresenceRegistry(nil)
+	}
+	if rooms == nil {
+		rooms = signaling.NewRoomManager(presence, nil)
+	}
+	return &Router{service: service, presence: presence, rooms: rooms, upgrader: websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}}
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	switch {
+	case req.URL.Path == "/api/v1/agent/ws":
+		r.handleAgentWebSocket(w, req)
+	case strings.HasPrefix(req.URL.Path, "/api/public/transfers/") && strings.HasSuffix(req.URL.Path, "/receiver/ws"):
+		r.handleBrowserReceiverWebSocket(w, req)
 	case req.URL.Path == "/healthz":
 		r.handleHealthz(w, req)
 	case req.URL.Path == "/api/v1/transfers":
 		r.handleTransfers(w, req)
 	case strings.HasPrefix(req.URL.Path, "/api/v1/transfers/"):
 		r.handleTransfer(w, req)
+	case req.URL.Path == "/api/v1/agents":
+		r.handleAgents(w, req)
 	case strings.HasPrefix(req.URL.Path, "/api/v1/agents/"):
 		r.handleAgent(w, req)
 	default:
@@ -79,6 +101,25 @@ func (r *Router) handleTransfer(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+func (r *Router) handleAgents(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if status := req.URL.Query().Get("status"); status != "" && status != "online" {
+		writeError(w, http.StatusBadRequest, "unsupported status filter")
+		return
+	}
+	agents := r.presence.OnlineAgents()
+	response := struct {
+		Agents []agentPresenceResponse `json:"agents"`
+	}{Agents: make([]agentPresenceResponse, 0, len(agents))}
+	for _, agent := range agents {
+		response.Agents = append(response.Agents, newAgentPresenceResponse(agent))
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
 func (r *Router) handleAgent(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -89,7 +130,27 @@ func (r *Router) handleAgent(w http.ResponseWriter, req *http.Request) {
 		http.NotFound(w, req)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"agent_id": agentID, "status": "unknown"})
+	presence, ok := r.presence.Agent(agentID)
+	if !ok {
+		writeJSON(w, http.StatusOK, map[string]string{"agent_id": agentID, "status": "offline"})
+		return
+	}
+	writeJSON(w, http.StatusOK, newAgentPresenceResponse(presence))
+}
+
+type agentPresenceResponse struct {
+	AgentID  string `json:"agent_id"`
+	Status   string `json:"status"`
+	Devices  int    `json:"devices"`
+	LastSeen string `json:"last_seen,omitempty"`
+}
+
+func newAgentPresenceResponse(presence signaling.AgentPresence) agentPresenceResponse {
+	status := "offline"
+	if presence.Online {
+		status = "online"
+	}
+	return agentPresenceResponse{AgentID: presence.AgentID, Status: status, Devices: len(presence.Devices), LastSeen: presence.LastSeen.Format(time.RFC3339)}
 }
 
 func (r *Router) listTransfers(w http.ResponseWriter, req *http.Request) {

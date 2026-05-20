@@ -19,10 +19,15 @@ type TokenIssuer interface {
 	NewAgentTicket() StoredToken
 }
 
+type TokenVerifier interface {
+	VerifyStoredToken(raw string, stored string) (bool, error)
+}
+
 type Service struct {
-	repo   Repository
-	tokens TokenIssuer
-	now    func() time.Time
+	repo     Repository
+	tokens   TokenIssuer
+	verifier TokenVerifier
+	now      func() time.Time
 }
 
 type CreateTransferResult struct {
@@ -35,10 +40,14 @@ func NewService(repo Repository, tokens TokenIssuer, now func() time.Time) *Serv
 	if tokens == nil {
 		tokens = RandomTokenIssuer{}
 	}
+	verifier, ok := tokens.(TokenVerifier)
+	if !ok {
+		verifier = RandomTokenIssuer{}
+	}
 	if now == nil {
 		now = func() time.Time { return time.Now().UTC() }
 	}
-	return &Service{repo: repo, tokens: tokens, now: now}
+	return &Service{repo: repo, tokens: tokens, verifier: verifier, now: now}
 }
 
 func (s *Service) CreateTransfer(ctx context.Context, input CreateTransferInput) (CreateTransferResult, error) {
@@ -76,8 +85,56 @@ func (s *Service) Get(ctx context.Context, id string) (TransferSession, error) {
 	return s.repo.Get(ctx, id)
 }
 
+func (s *Service) VerifyAgentTicket(ctx context.Context, transferID string, rawTicket string) (TransferSession, error) {
+	transfer, err := s.repo.Get(ctx, transferID)
+	if err != nil {
+		return TransferSession{}, err
+	}
+	if !s.isTransferUsable(transfer) {
+		return TransferSession{}, auth.ErrTicketExpired
+	}
+	ok, err := s.verifier.VerifyStoredToken(rawTicket, transfer.AgentTicketHash)
+	if err != nil || !ok {
+		return TransferSession{}, auth.ErrTicketInvalid
+	}
+	return transfer, nil
+}
+
+func (s *Service) VerifyPublicToken(ctx context.Context, rawToken string) (TransferSession, error) {
+	transfers, err := s.repo.ListActive(ctx)
+	if err != nil {
+		return TransferSession{}, err
+	}
+	for _, transfer := range transfers {
+		if transfer.PublicTokenHash == "" || !s.isTransferUsable(transfer) {
+			continue
+		}
+		ok, err := s.verifier.VerifyStoredToken(rawToken, transfer.PublicTokenHash)
+		if err == nil && ok {
+			return transfer, nil
+		}
+	}
+	return TransferSession{}, ErrSessionNotFound
+}
+
 func (s *Service) ListActive(ctx context.Context) ([]TransferSession, error) {
 	return s.repo.ListActive(ctx)
+}
+
+func (s *Service) isTransferUsable(transfer TransferSession) bool {
+	if isTerminalStatus(transfer.Status) {
+		return false
+	}
+	return s.now().Before(transfer.ExpiresAt)
+}
+
+func isTerminalStatus(status string) bool {
+	switch status {
+	case StatusCompleted, StatusFailed, StatusCancelled, StatusExpired:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Service) Cancel(ctx context.Context, id string) (TransferSession, error) {
@@ -124,6 +181,10 @@ func (i RandomTokenIssuer) StorePublicToken(raw string) string {
 		panic(fmt.Sprintf("hash public token: %v", err))
 	}
 	return stored
+}
+
+func (i RandomTokenIssuer) VerifyStoredToken(raw string, stored string) (bool, error) {
+	return auth.VerifyToken(raw, stored, i.pepper())
 }
 
 func (i RandomTokenIssuer) NewAgentTicket() StoredToken {
