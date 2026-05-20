@@ -8,7 +8,7 @@ import (
 )
 
 func TestRunAcceptsSkeletonCommands(t *testing.T) {
-	for _, name := range []string{"server", "senderd", "cli"} {
+	for _, name := range []string{"server", "agentd", "cli"} {
 		t.Run(name, func(t *testing.T) {
 			if err := app.Run(context.Background(), app.Options{Name: name}); err != nil {
 				t.Fatalf("Run(%q) returned error: %v", name, err)

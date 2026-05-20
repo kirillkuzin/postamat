@@ -2,51 +2,62 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-postamat is an agent-first secure file sharing service. The MVP lets an online AI agent share a local file with a human recipient through a normal browser link.
+postamat is an agent-native secure transfer control plane. The MVP lets online AI agents transfer files/data to other agents through Magic-Wormhole-like one-time WebRTC P2P sessions. A browser recipient link remains supported as an adapter flow.
 
-The server coordinates sessions and WebRTC signaling. File bytes are streamed from the local sender daemon to the recipient browser over WebRTC DataChannel, with application-level end-to-end encryption planned from the first release.
+The server coordinates transfer intent, agent presence, policy, audit, and WebRTC signaling. File bytes are streamed from local `postamat agentd` to another `agentd` or browser over WebRTC DataChannel, with application-level end-to-end encryption from the first release.
 
 > Status: early skeleton. The repository is not usable as a product yet.
 
 ## Goals
 
-- Go backend for session lifecycle, auth, signaling, audit, and public recipient UI.
-- Local `postamat senderd` sidecar near Hermes/agents for long-running P2P transfers.
+- Go backend for transfer lifecycle, agent identity, policy, signaling, audit, and public recipient UI.
+- Local `postamat agentd` near each agent for long-running bidirectional P2P transfers.
+- Agent-to-agent transfer as the primary MVP flow.
+- Browser `/p/{token}` recipient flow as an adapter.
 - REST + WebSocket as the canonical backend protocol.
-- MCP adapter as a control plane to `senderd`.
+- MCP adapter as a control plane to local `agentd`.
 - Self-hosted deployment with PostgreSQL, coturn, and a TLS reverse proxy.
 
 ## MVP scope
 
 Included:
 
-- WebRTC P2P transfer from online sender daemon to browser.
-- Public `/p/{token}` recipient flow.
+- WebRTC P2P transfer from online `agentd A` to online `agentd B`.
+- Agent WSS presence and incoming transfer offers.
 - Agent REST API for create/status/list/cancel.
-- Sender and receiver WebSocket signaling.
-- TTL, password, max downloads, cancel/revoke.
-- Metadata/audit storage only; no server-side file storage.
+- Receiver policy hooks and local inbox.
+- Public `/p/{token}` recipient flow.
+- SDP/ICE signaling over WSS.
+- TTL, cancel/revoke, transfer failure/expiry handling.
+- Metadata/audit storage only; no server-side plaintext file storage.
+- Explicit lifecycle states and MVP failure behavior: if `agentd` dies during connection or transfer, the transfer fails and a new one must be created.
 
 Not included in the MVP:
 
-- Stored/offline download links.
+- Stored/offline encrypted blob fallback.
 - Reverse upload.
-- Magic-Wormhole-style short-code live transfer.
+- Human short-code CLI mode.
+- Large-file resume/chunk ACKs.
 - Enterprise IAM, billing, DLP, mobile apps.
 
 ## Architecture sketch
 
 ```text
-Hermes / Agent
-  -> postamat senderd
-  -> backend REST + sender WSS
+Agent A -> postamat agentd A -> backend REST/WSS
+Agent B -> postamat agentd B --outbound WSS--> backend
 
-Recipient Browser
-  -> /p/{token}
-  -> public REST + receiver WSS
+Signaling/control:
+agentd A <---WSS---> backend <---WSS---> agentd B
 
 File path:
-postamat senderd ==E2E encrypted chunks over WebRTC DataChannel==> Browser
+agentd A ==E2E encrypted chunks over WebRTC DataChannel==> agentd B
+
+Browser adapter:
+agentd A ==E2E encrypted chunks over WebRTC DataChannel==> browser /p/{token}
+
+MVP lifecycle:
+created -> offered -> accepted -> connecting -> transferring -> completed
+terminal: failed, cancelled, expired
 ```
 
 ## Repository layout
@@ -54,7 +65,7 @@ postamat senderd ==E2E encrypted chunks over WebRTC DataChannel==> Browser
 ```text
 cmd/
   postamat/      CLI entrypoint placeholder
-  senderd/       sender daemon entrypoint placeholder
+  agentd/        agent daemon entrypoint placeholder
   server/        backend server entrypoint placeholder
 internal/
   app/           application command wiring
@@ -66,8 +77,9 @@ internal/
   crypto/        E2E chunk encryption protocol
   db/            repositories and migrations
   p2p/           WebRTC P2P orchestration
-  signaling/     WSS rooms and SDP/ICE routing
-  senderd/       local daemon runtime
+  policy/        transfer policy checks
+  signaling/     WSS rooms, presence, SDP/ICE routing
+  agentd/        local daemon runtime
   integrations/  MCP/ACP adapters
 migrations/      database migrations
 deployments/     Docker Compose and reverse proxy config
@@ -80,7 +92,7 @@ Some directories are placeholders until their first tested implementation lands.
 
 Requirements:
 
-- Go 1.22+
+- Go 1.26.3 or newer compatible toolchain. Use latest stable Go and latest stable dependencies at implementation time.
 
 Run tests:
 
@@ -92,7 +104,7 @@ Build skeleton binaries:
 
 ```bash
 go build ./cmd/server
-go build ./cmd/senderd
+go build ./cmd/agentd
 go build ./cmd/postamat
 ```
 
