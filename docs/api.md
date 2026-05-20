@@ -1,6 +1,6 @@
 # API Draft
 
-The API is not implemented yet. This draft captures the agent-to-agent MVP shape.
+The first REST skeleton is implemented for local development. This draft captures the agent-to-agent MVP shape and will evolve as auth, persistence, and signaling land.
 
 ## Agent REST API
 
@@ -14,11 +14,25 @@ GET    /api/v1/agents?status=online
 GET    /api/v1/agent/ws?ticket=...
 ```
 
-Targets:
+Targets use flat transfer-intent fields in the initial REST skeleton:
 
 ```json
-{ "to": { "type": "agent", "agent_id": "agent-b" } }
-{ "to": { "type": "browser_link" } }
+{
+  "from_agent_id": "agent-a",
+  "to_agent_id": "agent-b",
+  "target": "agent",
+  "file_name": "report.pdf",
+  "file_size_bytes": 42
+}
+```
+
+```json
+{
+  "from_agent_id": "agent-a",
+  "target": "browser_link",
+  "file_name": "report.pdf",
+  "file_size_bytes": 42
+}
 ```
 
 ## Public recipient API
