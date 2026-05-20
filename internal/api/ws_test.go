@@ -161,20 +161,145 @@ func TestAgentWebSocketReceivesRoutedOffer(t *testing.T) {
 	}
 }
 
-func TestBrowserReceiverWebSocketEndpointAcceptsTokenScopedPath(t *testing.T) {
+func TestBrowserReceiverWebSocketEndpointAcceptsTicketScopedPath(t *testing.T) {
 	service := secureTestService()
 	created := createWSTransfer(t, service, sessions.TargetBrowserLink)
+	ticket := issueBrowserReceiverTicket(t, service, created.PublicToken)
 	presence := signaling.NewPresenceRegistry(nil)
 	rooms := signaling.NewRoomManager(presence, nil)
 	server := httptest.NewServer(api.NewRouterWithSignaling(service, presence, rooms))
 	defer server.Close()
 
-	conn := dialWS(t, browserWSURL(server.URL, created))
+	conn := dialWS(t, browserWSURL(server.URL, created, ticket))
 	defer conn.Close()
 	writeEnvelope(t, conn, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "browser_recipient", DeviceID: "browser_1"})
 	ack := readEnvelope(t, conn)
-	if ack.Type != signaling.MessageAgentPresence {
-		t.Fatalf("expected presence ack, got %+v", ack)
+	if ack.Type != signaling.MessageAgentPresence || ack.AgentID != browserAgentID(created) {
+		t.Fatalf("expected transfer-scoped browser presence ack, got %+v", ack)
+	}
+}
+
+func TestBrowserReceiverWebSocketRoutingIsTransferScoped(t *testing.T) {
+	service := secureTestService()
+	first := createWSTransfer(t, service, sessions.TargetBrowserLink)
+	second := createWSTransfer(t, service, sessions.TargetBrowserLink)
+	firstTicket := issueBrowserReceiverTicket(t, service, first.PublicToken)
+	secondTicket := issueBrowserReceiverTicket(t, service, second.PublicToken)
+	presence := signaling.NewPresenceRegistry(nil)
+	rooms := signaling.NewRoomManager(presence, nil)
+	server := httptest.NewServer(api.NewRouterWithSignaling(service, presence, rooms))
+	defer server.Close()
+
+	firstBrowser := dialWS(t, browserWSURL(server.URL, first, firstTicket))
+	defer firstBrowser.Close()
+	writeEnvelope(t, firstBrowser, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "browser_recipient", DeviceID: "browser_1"})
+	readEnvelope(t, firstBrowser)
+
+	secondBrowser := dialWS(t, browserWSURL(server.URL, second, secondTicket))
+	defer secondBrowser.Close()
+	writeEnvelope(t, secondBrowser, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "browser_recipient", DeviceID: "browser_2"})
+	readEnvelope(t, secondBrowser)
+
+	agent := dialWS(t, agentWSURL(server.URL, first))
+	defer agent.Close()
+	writeEnvelope(t, agent, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "agent_a", DeviceID: "agent_dev"})
+	readEnvelope(t, agent)
+	writeEnvelope(t, agent, signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: first.Transfer.ID, FromAgentID: "agent_a", ToAgentID: browserAgentID(first)})
+
+	got := readEnvelope(t, firstBrowser)
+	if got.Type != signaling.MessageTransferOffer || got.TransferID != first.Transfer.ID || got.ToAgentID != browserAgentID(first) {
+		t.Fatalf("first browser got unexpected envelope: %+v", got)
+	}
+	_ = secondBrowser.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	var leaked signaling.Envelope
+	if err := secondBrowser.ReadJSON(&leaked); err == nil {
+		t.Fatalf("second browser received cross-transfer envelope: %+v", leaked)
+	}
+	_ = secondBrowser.SetReadDeadline(time.Time{})
+}
+
+func TestBrowserReceiverWebSocketRoutesBackToTransferScopedSenderSocket(t *testing.T) {
+	service := secureTestService()
+	first := createWSTransfer(t, service, sessions.TargetBrowserLink)
+	second := createWSTransfer(t, service, sessions.TargetBrowserLink)
+	secondTicket := issueBrowserReceiverTicket(t, service, second.PublicToken)
+	server := httptest.NewServer(api.NewRouterWithSignaling(service, signaling.NewPresenceRegistry(nil), nil))
+	defer server.Close()
+
+	firstAgent := dialWS(t, agentWSURL(server.URL, first))
+	defer firstAgent.Close()
+	writeEnvelope(t, firstAgent, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "agent_a", DeviceID: "agent_first"})
+	readEnvelope(t, firstAgent)
+
+	secondAgent := dialWS(t, agentWSURL(server.URL, second))
+	defer secondAgent.Close()
+	writeEnvelope(t, secondAgent, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "agent_a", DeviceID: "agent_second"})
+	readEnvelope(t, secondAgent)
+
+	secondBrowser := dialWS(t, browserWSURL(server.URL, second, secondTicket))
+	defer secondBrowser.Close()
+	writeEnvelope(t, secondBrowser, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "browser_recipient", DeviceID: "browser_second"})
+	readEnvelope(t, secondBrowser)
+	writeEnvelope(t, secondBrowser, signaling.Envelope{Type: signaling.MessageTransferAccepted, TransferID: second.Transfer.ID, FromAgentID: browserAgentID(second), ToAgentID: "agent_a"})
+
+	got := readEnvelope(t, secondAgent)
+	if got.Type != signaling.MessageTransferAccepted || got.TransferID != second.Transfer.ID || got.FromAgentID != browserAgentID(second) {
+		t.Fatalf("second agent got unexpected envelope: %+v", got)
+	}
+	_ = firstAgent.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	var leaked signaling.Envelope
+	if err := firstAgent.ReadJSON(&leaked); err == nil {
+		t.Fatalf("first agent received cross-transfer browser response: %+v", leaked)
+	}
+	_ = firstAgent.SetReadDeadline(time.Time{})
+}
+
+func TestBrowserReceiverWebSocketDoesNotFallbackToOtherTransferSenderSocket(t *testing.T) {
+	service := secureTestService()
+	first := createWSTransfer(t, service, sessions.TargetBrowserLink)
+	second := createWSTransfer(t, service, sessions.TargetBrowserLink)
+	firstTicket := issueBrowserReceiverTicket(t, service, first.PublicToken)
+	server := httptest.NewServer(api.NewRouterWithSignaling(service, signaling.NewPresenceRegistry(nil), nil))
+	defer server.Close()
+
+	secondAgent := dialWS(t, agentWSURL(server.URL, second))
+	defer secondAgent.Close()
+	writeEnvelope(t, secondAgent, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "agent_a", DeviceID: "agent_second"})
+	readEnvelope(t, secondAgent)
+
+	firstBrowser := dialWS(t, browserWSURL(server.URL, first, firstTicket))
+	defer firstBrowser.Close()
+	writeEnvelope(t, firstBrowser, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "browser_recipient", DeviceID: "browser_first"})
+	readEnvelope(t, firstBrowser)
+	writeEnvelope(t, firstBrowser, signaling.Envelope{Type: signaling.MessageTransferAccepted, TransferID: first.Transfer.ID, FromAgentID: browserAgentID(first), ToAgentID: "agent_a"})
+
+	got := readEnvelope(t, firstBrowser)
+	if got.Type != signaling.MessageError {
+		t.Fatalf("expected offline error when matching sender transfer socket is absent, got %+v", got)
+	}
+	_ = secondAgent.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	var leaked signaling.Envelope
+	if err := secondAgent.ReadJSON(&leaked); err == nil {
+		t.Fatalf("second transfer sender received fallback-routed message: %+v", leaked)
+	}
+	_ = secondAgent.SetReadDeadline(time.Time{})
+}
+
+func TestBrowserReceiverWebSocketRejectsEmptyTransferRoutedMessages(t *testing.T) {
+	service := secureTestService()
+	created := createWSTransfer(t, service, sessions.TargetBrowserLink)
+	ticket := issueBrowserReceiverTicket(t, service, created.PublicToken)
+	server := httptest.NewServer(api.NewRouterWithSignaling(service, signaling.NewPresenceRegistry(nil), nil))
+	defer server.Close()
+
+	conn := dialWS(t, browserWSURL(server.URL, created, ticket))
+	defer conn.Close()
+	writeEnvelope(t, conn, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "browser_recipient", DeviceID: "browser_1"})
+	readEnvelope(t, conn)
+	writeEnvelope(t, conn, signaling.Envelope{Type: signaling.MessageError, FromAgentID: browserAgentID(created), ToAgentID: "agent_a"})
+	got := readEnvelope(t, conn)
+	if got.Type != signaling.MessageError {
+		t.Fatalf("expected empty-transfer message to be rejected, got %+v", got)
 	}
 }
 
@@ -184,7 +309,7 @@ func TestBrowserReceiverWebSocketRejectsMalformedPath(t *testing.T) {
 	server := httptest.NewServer(api.NewRouterWithSignaling(service, signaling.NewPresenceRegistry(nil), nil))
 	defer server.Close()
 
-	_, response, err := websocket.DefaultDialer.Dial(wsURL(server.URL+"/api/public/transfers/"+url.QueryEscape(created.PublicToken)+"/extra/receiver/ws?ticket="+url.QueryEscape(created.PublicToken)), nil)
+	_, response, err := websocket.DefaultDialer.Dial(wsURL(server.URL+"/api/public/transfers/"+url.QueryEscape(created.PublicToken)+"/extra/receiver/ws?ticket=wrong"), nil)
 	if err == nil {
 		t.Fatalf("expected websocket dial to fail for malformed path")
 	}
@@ -196,16 +321,17 @@ func TestBrowserReceiverWebSocketRejectsMalformedPath(t *testing.T) {
 func TestBrowserReceiverWebSocketDoesNotAcceptArbitraryAgentIdentity(t *testing.T) {
 	service := secureTestService()
 	created := createWSTransfer(t, service, sessions.TargetBrowserLink)
+	ticket := issueBrowserReceiverTicket(t, service, created.PublicToken)
 	presence := signaling.NewPresenceRegistry(nil)
 	server := httptest.NewServer(api.NewRouterWithSignaling(service, presence, nil))
 	defer server.Close()
 
-	conn := dialWS(t, browserWSURL(server.URL, created))
+	conn := dialWS(t, browserWSURL(server.URL, created, ticket))
 	defer conn.Close()
 	writeEnvelope(t, conn, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "agent_a", DeviceID: "browser_1"})
 	ack := readEnvelope(t, conn)
-	if ack.Type != signaling.MessageAgentPresence || ack.AgentID != "browser_recipient" {
-		t.Fatalf("expected browser recipient identity, got %+v", ack)
+	if ack.Type != signaling.MessageAgentPresence || ack.AgentID != browserAgentID(created) {
+		t.Fatalf("expected transfer-scoped browser recipient identity, got %+v", ack)
 	}
 	if _, ok := presence.Agent("agent_a"); ok {
 		t.Fatalf("browser receiver must not register as arbitrary agent")
@@ -215,10 +341,11 @@ func TestBrowserReceiverWebSocketDoesNotAcceptArbitraryAgentIdentity(t *testing.
 func TestBrowserReceiverWebSocketCannotTargetArbitraryAgent(t *testing.T) {
 	service := secureTestService()
 	created := createWSTransfer(t, service, sessions.TargetBrowserLink)
+	ticket := issueBrowserReceiverTicket(t, service, created.PublicToken)
 	server := httptest.NewServer(api.NewRouterWithSignaling(service, signaling.NewPresenceRegistry(nil), nil))
 	defer server.Close()
 
-	conn := dialWS(t, browserWSURL(server.URL, created))
+	conn := dialWS(t, browserWSURL(server.URL, created, ticket))
 	defer conn.Close()
 	writeEnvelope(t, conn, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "browser_recipient", DeviceID: "browser_1"})
 	readEnvelope(t, conn)
@@ -260,8 +387,21 @@ func agentWSURL(baseURL string, created sessions.CreateTransferResult) string {
 	return baseURL + "/api/v1/agent/ws?transfer_id=" + url.QueryEscape(created.Transfer.ID) + "&ticket=" + url.QueryEscape(created.AgentTicket)
 }
 
-func browserWSURL(baseURL string, created sessions.CreateTransferResult) string {
-	return baseURL + "/api/public/transfers/" + url.PathEscape(created.PublicToken) + "/receiver/ws?ticket=" + url.QueryEscape(created.PublicToken)
+func browserWSURL(baseURL string, created sessions.CreateTransferResult, receiverTicket string) string {
+	return baseURL + "/api/public/transfers/" + url.PathEscape(created.PublicToken) + "/receiver/ws?ticket=" + url.QueryEscape(receiverTicket)
+}
+
+func browserAgentID(created sessions.CreateTransferResult) string {
+	return "browser_recipient:" + created.Transfer.ID
+}
+
+func issueBrowserReceiverTicket(t *testing.T, service *sessions.Service, publicToken string) string {
+	t.Helper()
+	issued, err := service.IssueBrowserReceiverTicket(context.Background(), publicToken, sessions.ReceiverConsent{Accepted: true})
+	if err != nil {
+		t.Fatalf("IssueBrowserReceiverTicket: %v", err)
+	}
+	return issued.ReceiverTicket
 }
 
 func dialWS(t *testing.T, rawURL string) *websocket.Conn {

@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"net/http"
 	"strings"
 	"time"
@@ -10,13 +11,15 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/kirillkuzin/postamat/internal/sessions"
 	"github.com/kirillkuzin/postamat/internal/signaling"
+	recipient "github.com/kirillkuzin/postamat/web/recipient"
 )
 
 type Router struct {
-	service  *sessions.Service
-	presence *signaling.PresenceRegistry
-	rooms    *signaling.RoomManager
-	upgrader websocket.Upgrader
+	service         *sessions.Service
+	presence        *signaling.PresenceRegistry
+	rooms           *signaling.RoomManager
+	recipientAssets fs.FS
+	upgrader        websocket.Upgrader
 }
 
 func NewRouter(service *sessions.Service) http.Handler {
@@ -31,7 +34,7 @@ func NewRouterWithSignaling(service *sessions.Service, presence *signaling.Prese
 	if rooms == nil {
 		rooms = signaling.NewRoomManager(presence, nil)
 	}
-	return &Router{service: service, presence: presence, rooms: rooms, upgrader: websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}}
+	return &Router{service: service, presence: presence, rooms: rooms, recipientAssets: recipient.DistFS(), upgrader: websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}}
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -40,6 +43,12 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		r.handleAgentWebSocket(w, req)
 	case strings.HasPrefix(req.URL.Path, "/api/public/transfers/") && strings.HasSuffix(req.URL.Path, "/receiver/ws"):
 		r.handleBrowserReceiverWebSocket(w, req)
+	case strings.HasPrefix(req.URL.Path, "/api/public/transfers/"):
+		r.handlePublicTransfer(w, req)
+	case strings.HasPrefix(req.URL.Path, "/p/"):
+		r.handleRecipientApp(w, req)
+	case strings.HasPrefix(req.URL.Path, "/assets/"):
+		r.handleRecipientAsset(w, req)
 	case req.URL.Path == "/healthz":
 		r.handleHealthz(w, req)
 	case req.URL.Path == "/api/v1/transfers":

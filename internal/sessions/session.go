@@ -24,18 +24,22 @@ const (
 )
 
 var (
-	ErrFromAgentRequired       = errors.New("from agent id is required")
-	ErrTargetRequired          = errors.New("target is required")
-	ErrUnsupportedTarget       = errors.New("unsupported transfer target")
-	ErrTargetAgentRequired     = errors.New("target agent id is required")
-	ErrFileNameRequired        = errors.New("file name is required")
-	ErrFileSizeNegative        = errors.New("file size must be non-negative")
-	ErrTTLNotPositive          = errors.New("ttl must be positive")
-	ErrMaxDownloadsNotPositive = errors.New("max downloads must be positive")
-	ErrFailureReasonRequired   = errors.New("failure reason is required")
-	ErrInvalidStatusTransition = errors.New("invalid status transition")
-	ErrTerminalSession         = errors.New("terminal session cannot transition")
-	ErrSessionNotFound         = errors.New("session not found")
+	ErrFromAgentRequired        = errors.New("from agent id is required")
+	ErrTargetRequired           = errors.New("target is required")
+	ErrUnsupportedTarget        = errors.New("unsupported transfer target")
+	ErrTargetAgentRequired      = errors.New("target agent id is required")
+	ErrFileNameRequired         = errors.New("file name is required")
+	ErrFileSizeNegative         = errors.New("file size must be non-negative")
+	ErrTTLNotPositive           = errors.New("ttl must be positive")
+	ErrMaxDownloadsNotPositive  = errors.New("max downloads must be positive")
+	ErrFailureReasonRequired    = errors.New("failure reason is required")
+	ErrInvalidStatusTransition  = errors.New("invalid status transition")
+	ErrTerminalSession          = errors.New("terminal session cannot transition")
+	ErrSessionNotFound          = errors.New("session not found")
+	ErrReceiverConsentRequired  = errors.New("receiver consent is required")
+	ErrReceiverPasswordRequired = errors.New("receiver password is required")
+	ErrReceiverPasswordInvalid  = errors.New("receiver password is invalid")
+	ErrReceiverTicketNotIssued  = errors.New("receiver ticket has not been issued")
 )
 
 const defaultTransferTTL = 30 * time.Minute
@@ -52,14 +56,16 @@ type CreateTransferInput struct {
 }
 
 type TransferSession struct {
-	ID              string
-	Transport       string
-	Target          string
-	Status          string
-	FromAgentID     string
-	ToAgentID       string
-	PublicTokenHash string
-	AgentTicketHash string
+	ID                      string
+	Transport               string
+	Target                  string
+	Status                  string
+	FromAgentID             string
+	ToAgentID               string
+	PublicTokenHash         string
+	AgentTicketHash         string
+	ReceiverTicketHash      string
+	ReceiverTicketExpiresAt *time.Time
 
 	FileName      string
 	FileSizeBytes int64
@@ -214,6 +220,10 @@ func cloneSession(session TransferSession) TransferSession {
 	if session.PasswordHash != nil {
 		passwordHash := *session.PasswordHash
 		session.PasswordHash = &passwordHash
+	}
+	if session.ReceiverTicketExpiresAt != nil {
+		receiverTicketExpiresAt := *session.ReceiverTicketExpiresAt
+		session.ReceiverTicketExpiresAt = &receiverTicketExpiresAt
 	}
 	if session.CompletedAt != nil {
 		completedAt := *session.CompletedAt

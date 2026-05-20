@@ -193,6 +193,42 @@ func TestServiceCanMarkFailedAndExpired(t *testing.T) {
 	}
 }
 
+func TestServiceIssuesAndVerifiesBrowserReceiverTicketAfterConsent(t *testing.T) {
+	now := time.Date(2026, 5, 19, 12, 10, 0, 0, time.UTC)
+	service := sessions.NewService(sessions.NewMemoryRepository(), sessions.RandomTokenIssuer{Pepper: "test-pepper"}, func() time.Time { return now })
+	created, err := service.CreateTransfer(context.Background(), validTransferInput(func(input *sessions.CreateTransferInput) {
+		input.Target = sessions.TargetBrowserLink
+		input.ToAgentID = ""
+	}))
+	if err != nil {
+		t.Fatalf("CreateTransfer returned error: %v", err)
+	}
+
+	if _, err := service.IssueBrowserReceiverTicket(context.Background(), created.PublicToken, sessions.ReceiverConsent{}); !errors.Is(err, sessions.ErrReceiverConsentRequired) {
+		t.Fatalf("IssueBrowserReceiverTicket without consent error = %v, want %v", err, sessions.ErrReceiverConsentRequired)
+	}
+	issued, err := service.IssueBrowserReceiverTicket(context.Background(), created.PublicToken, sessions.ReceiverConsent{Accepted: true})
+	if err != nil {
+		t.Fatalf("IssueBrowserReceiverTicket returned error: %v", err)
+	}
+	if issued.ReceiverTicket == "" || issued.ReceiverTicket == created.PublicToken {
+		t.Fatalf("receiver ticket must be non-empty and distinct from public token: %#v", issued)
+	}
+	if got, want := issued.ExpiresAt, now.Add(5*time.Minute); !got.Equal(want) {
+		t.Fatalf("receiver ticket ExpiresAt = %v, want %v", got, want)
+	}
+	verified, err := service.VerifyBrowserReceiverTicket(context.Background(), created.PublicToken, issued.ReceiverTicket)
+	if err != nil {
+		t.Fatalf("VerifyBrowserReceiverTicket returned error: %v", err)
+	}
+	if verified.ID != created.Transfer.ID {
+		t.Fatalf("verified transfer ID = %q, want %q", verified.ID, created.Transfer.ID)
+	}
+	if _, err := service.VerifyBrowserReceiverTicket(context.Background(), created.PublicToken, created.PublicToken); err == nil {
+		t.Fatal("VerifyBrowserReceiverTicket should reject public token as receiver ticket")
+	}
+}
+
 func TestServiceCancelChangesStatus(t *testing.T) {
 	service := newTestService()
 	created, err := service.CreateTransfer(context.Background(), validTransferInput(nil))
@@ -257,6 +293,7 @@ type fakeTokenIssuer struct {
 	transferID int
 	public     int
 	agent      int
+	receiver   int
 }
 
 func (f *fakeTokenIssuer) NewTransferID() string {
@@ -277,5 +314,13 @@ func (f *fakeTokenIssuer) NewAgentTicket() sessions.StoredToken {
 	return sessions.StoredToken{
 		Raw:    "agent_ticket_" + string(rune('0'+f.agent)),
 		Stored: "agent_ticket_hash_" + string(rune('0'+f.agent)),
+	}
+}
+
+func (f *fakeTokenIssuer) NewReceiverTicket(transferID string) sessions.StoredToken {
+	f.receiver++
+	return sessions.StoredToken{
+		Raw:    "receiver_ticket_" + string(rune('0'+f.receiver)),
+		Stored: "receiver_ticket_hash_" + string(rune('0'+f.receiver)) + "_" + transferID,
 	}
 }
