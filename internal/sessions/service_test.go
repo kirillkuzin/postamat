@@ -68,6 +68,73 @@ func TestServiceGetReturnsExistingTransfer(t *testing.T) {
 	}
 }
 
+func TestServiceVerifiesStoredAgentTicketAndPublicToken(t *testing.T) {
+	service := sessions.NewService(sessions.NewMemoryRepository(), sessions.RandomTokenIssuer{Pepper: "test-pepper"}, func() time.Time {
+		return time.Date(2026, 5, 19, 12, 10, 0, 0, time.UTC)
+	})
+	agentTransfer, err := service.CreateTransfer(context.Background(), validTransferInput(nil))
+	if err != nil {
+		t.Fatalf("CreateTransfer agent returned error: %v", err)
+	}
+
+	verifiedAgent, err := service.VerifyAgentTicket(context.Background(), agentTransfer.Transfer.ID, agentTransfer.AgentTicket)
+	if err != nil {
+		t.Fatalf("VerifyAgentTicket returned error: %v", err)
+	}
+	if verifiedAgent.ID != agentTransfer.Transfer.ID {
+		t.Fatalf("verified transfer ID = %q, want %q", verifiedAgent.ID, agentTransfer.Transfer.ID)
+	}
+	if _, err := service.VerifyAgentTicket(context.Background(), agentTransfer.Transfer.ID, "wrong-ticket"); err == nil {
+		t.Fatal("VerifyAgentTicket should reject wrong ticket")
+	}
+
+	browserTransfer, err := service.CreateTransfer(context.Background(), validTransferInput(func(input *sessions.CreateTransferInput) {
+		input.Target = sessions.TargetBrowserLink
+		input.ToAgentID = ""
+	}))
+	if err != nil {
+		t.Fatalf("CreateTransfer browser returned error: %v", err)
+	}
+	verifiedPublic, err := service.VerifyPublicToken(context.Background(), browserTransfer.PublicToken)
+	if err != nil {
+		t.Fatalf("VerifyPublicToken returned error: %v", err)
+	}
+	if verifiedPublic.ID != browserTransfer.Transfer.ID {
+		t.Fatalf("verified public transfer ID = %q, want %q", verifiedPublic.ID, browserTransfer.Transfer.ID)
+	}
+	if _, err := service.VerifyPublicToken(context.Background(), "wrong-token"); err == nil {
+		t.Fatal("VerifyPublicToken should reject wrong token")
+	}
+}
+
+func TestServiceRejectsTicketsForExpiredOrTerminalTransfers(t *testing.T) {
+	now := time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC)
+	service := sessions.NewService(sessions.NewMemoryRepository(), sessions.RandomTokenIssuer{}, func() time.Time { return now })
+	expiring, err := service.CreateTransfer(context.Background(), validTransferInput(func(input *sessions.CreateTransferInput) {
+		input.TTL = time.Minute
+	}))
+	if err != nil {
+		t.Fatalf("CreateTransfer expiring returned error: %v", err)
+	}
+	now = now.Add(2 * time.Minute)
+	if _, err := service.VerifyAgentTicket(context.Background(), expiring.Transfer.ID, expiring.AgentTicket); err == nil {
+		t.Fatal("VerifyAgentTicket should reject expired transfer")
+	}
+
+	terminal, err := service.CreateTransfer(context.Background(), validTransferInput(func(input *sessions.CreateTransferInput) {
+		input.FileName = "terminal.pdf"
+	}))
+	if err != nil {
+		t.Fatalf("CreateTransfer terminal returned error: %v", err)
+	}
+	if _, err := service.Cancel(context.Background(), terminal.Transfer.ID); err != nil {
+		t.Fatalf("Cancel returned error: %v", err)
+	}
+	if _, err := service.VerifyAgentTicket(context.Background(), terminal.Transfer.ID, terminal.AgentTicket); err == nil {
+		t.Fatal("VerifyAgentTicket should reject terminal transfer")
+	}
+}
+
 func TestServiceListActiveExcludesTerminalTransfers(t *testing.T) {
 	service := newTestService()
 	first, err := service.CreateTransfer(context.Background(), validTransferInput(nil))
