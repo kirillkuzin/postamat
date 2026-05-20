@@ -1,0 +1,3 @@
+# Project documents live outside git (Obsidian)
+*.md
+docs/
