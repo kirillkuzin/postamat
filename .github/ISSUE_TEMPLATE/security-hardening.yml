@@ -1,0 +1,29 @@
+name: Security hardening idea
+description: Public, non-sensitive security improvement proposal
+title: "security: "
+labels: ["security", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this only for non-sensitive hardening ideas. If you found a vulnerability, follow SECURITY.md and do not disclose details publicly.
+  - type: textarea
+    id: area
+    attributes:
+      label: Area
+      description: "Which area is affected? Examples: keys, tokens, signaling, local daemon, inbox, browser recipient, deployment."
+    validations:
+      required: true
+  - type: textarea
+    id: improvement
+    attributes:
+      label: Proposed hardening
+    validations:
+      required: true
+  - type: textarea
+    id: risk
+    attributes:
+      label: Risk reduction
+      description: What risk does this reduce?
+    validations:
+      required: true
