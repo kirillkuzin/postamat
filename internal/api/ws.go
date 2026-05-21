@@ -49,7 +49,7 @@ func (r *Router) handleAgentWebSocket(w http.ResponseWriter, req *http.Request) 
 		allowedAgents[transfer.ToAgentID] = struct{}{}
 		allowedTargets[transfer.ToAgentID] = struct{}{}
 	} else {
-		allowedTargets["browser_recipient"] = struct{}{}
+		allowedTargets[browserRecipientAgentID(transfer.ID)] = struct{}{}
 	}
 	r.handleSignalingWebSocket(w, req, websocketAuth{AllowedAgents: allowedAgents, AllowedTargets: allowedTargets, TransferID: transfer.ID})
 }
@@ -60,16 +60,22 @@ func (r *Router) handleBrowserReceiverWebSocket(w http.ResponseWriter, req *http
 		http.NotFound(w, req)
 		return
 	}
-	if req.URL.Query().Get("ticket") != publicToken {
-		writeError(w, http.StatusUnauthorized, "invalid ticket")
+	ticket := req.URL.Query().Get("ticket")
+	if ticket == "" {
+		writeError(w, http.StatusUnauthorized, "ticket is required")
 		return
 	}
-	transfer, err := r.service.VerifyPublicToken(req.Context(), publicToken)
+	transfer, err := r.service.VerifyBrowserReceiverTicket(req.Context(), publicToken, ticket)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "invalid public token")
 		return
 	}
-	r.handleSignalingWebSocket(w, req, websocketAuth{AgentID: "browser_recipient", AllowedTargets: map[string]struct{}{transfer.FromAgentID: {}, "browser_recipient": {}}, TransferID: transfer.ID, Browser: true})
+	browserAgentID := browserRecipientAgentID(transfer.ID)
+	r.handleSignalingWebSocket(w, req, websocketAuth{AgentID: browserAgentID, AllowedTargets: map[string]struct{}{transfer.FromAgentID: {}, browserAgentID: {}}, TransferID: transfer.ID, Browser: true})
+}
+
+func browserRecipientAgentID(transferID string) string {
+	return "browser_recipient:" + transferID
 }
 
 func receiverTokenFromPath(path string) (string, bool) {
@@ -104,7 +110,7 @@ func (r *Router) handleSignalingWebSocket(w http.ResponseWriter, req *http.Reque
 	}
 	auth.AgentID = agentID
 	r.presence.Register(signaling.DevicePresence{AgentID: agentID, DeviceID: deviceID, Capabilities: []string{"webrtc_datachannel"}})
-	r.rooms.AttachPeer(agentID, deviceID, peer)
+	r.rooms.AttachTransferPeer(agentID, deviceID, auth.TransferID, peer)
 	_ = peer.Send(signaling.Envelope{Type: signaling.MessageAgentPresence, AgentID: agentID, DeviceID: deviceID})
 	defer r.rooms.DetachPeer(agentID, deviceID, peer)
 
@@ -117,9 +123,18 @@ func (r *Router) handleSignalingWebSocket(w http.ResponseWriter, req *http.Reque
 			_ = peer.Send(signaling.Envelope{Type: signaling.MessagePong, AgentID: agentID, DeviceID: deviceID})
 			continue
 		}
+		if envelope.Type == signaling.MessagePong {
+			continue
+		}
 		if envelope.Type == signaling.MessageAgentPresence {
 			r.presence.Touch(agentID, deviceID)
 			continue
+		}
+		if envelope.TransferID == auth.TransferID {
+			if _, err := r.service.VerifyTransferUsable(req.Context(), auth.TransferID); err != nil {
+				_ = peer.Send(errorEnvelope("transfer is no longer active"))
+				return
+			}
 		}
 		if err := authorizeOutboundEnvelope(auth, envelope); err != nil {
 			_ = peer.Send(errorEnvelope(err.Error()))
@@ -132,16 +147,14 @@ func (r *Router) handleSignalingWebSocket(w http.ResponseWriter, req *http.Reque
 }
 
 func authorizeOutboundEnvelope(auth websocketAuth, envelope signaling.Envelope) error {
-	if envelope.TransferID != "" && envelope.TransferID != auth.TransferID {
+	if envelope.TransferID != auth.TransferID {
 		return sessions.ErrSessionNotFound
 	}
-	if envelope.TransferID == auth.TransferID && envelope.Type != signaling.MessagePing && envelope.Type != signaling.MessagePong {
-		if envelope.FromAgentID == "" || envelope.FromAgentID != auth.AgentID {
-			return signaling.ErrAgentIDRequired
-		}
-		if envelope.ToAgentID == "" || !auth.allowsTarget(envelope.ToAgentID) {
-			return signaling.ErrRouteTargetRequired
-		}
+	if envelope.FromAgentID == "" || envelope.FromAgentID != auth.AgentID {
+		return signaling.ErrAgentIDRequired
+	}
+	if envelope.ToAgentID == "" || !auth.allowsTarget(envelope.ToAgentID) {
+		return signaling.ErrRouteTargetRequired
 	}
 	return nil
 }
@@ -157,7 +170,7 @@ func (r *Router) readHello(conn *websocket.Conn, auth websocketAuth) (string, st
 		return "", "", false
 	}
 	if auth.Browser {
-		hello.AgentID = "browser_recipient"
+		hello.AgentID = auth.AgentID
 	}
 	if err := hello.Validate(); err != nil || hello.Type != signaling.MessageAgentHello || !auth.allowsAgent(hello.AgentID) {
 		_ = conn.WriteJSON(errorEnvelope("invalid hello"))

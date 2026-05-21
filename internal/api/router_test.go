@@ -53,6 +53,7 @@ type fixedTokenIssuer struct {
 	transfer int
 	public   int
 	agent    int
+	receiver int
 }
 
 func (f *fixedTokenIssuer) NewTransferID() string {
@@ -68,4 +69,15 @@ func (f *fixedTokenIssuer) NewPublicToken() sessions.StoredToken {
 func (f *fixedTokenIssuer) NewAgentTicket() sessions.StoredToken {
 	f.agent++
 	return sessions.StoredToken{Raw: "agent_ticket_" + string(rune('0'+f.agent)), Stored: "agent_hash_" + string(rune('0'+f.agent))}
+}
+
+func (f *fixedTokenIssuer) NewReceiverTicket(transferID string) sessions.StoredToken {
+	f.receiver++
+	return sessions.StoredToken{Raw: "receiver_ticket_" + string(rune('0'+f.receiver)), Stored: "receiver_hash_" + string(rune('0'+f.receiver)) + "_" + transferID}
+}
+
+func (f *fixedTokenIssuer) VerifyStoredToken(raw string, stored string) (bool, error) {
+	return (raw == "public_token_1" && stored == "public_hash_1") ||
+		(raw == "agent_ticket_1" && stored == "agent_hash_1") ||
+		(raw == "browser_recipient:transfer_1:receiver_ticket_1" && stored == "receiver_hash_1_transfer_1"), nil
 }

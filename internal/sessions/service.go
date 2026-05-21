@@ -17,6 +17,7 @@ type TokenIssuer interface {
 	NewTransferID() string
 	NewPublicToken() StoredToken
 	NewAgentTicket() StoredToken
+	NewReceiverTicket(transferID string) StoredToken
 }
 
 type TokenVerifier interface {
@@ -35,6 +36,19 @@ type CreateTransferResult struct {
 	PublicToken string
 	AgentTicket string
 }
+
+type ReceiverConsent struct {
+	Accepted bool
+	Password string
+}
+
+type BrowserReceiverTicket struct {
+	Transfer       TransferSession
+	ReceiverTicket string
+	ExpiresAt      time.Time
+}
+
+const receiverTicketTTL = 5 * time.Minute
 
 func NewService(repo Repository, tokens TokenIssuer, now func() time.Time) *Service {
 	if tokens == nil {
@@ -106,7 +120,7 @@ func (s *Service) VerifyPublicToken(ctx context.Context, rawToken string) (Trans
 		return TransferSession{}, err
 	}
 	for _, transfer := range transfers {
-		if transfer.PublicTokenHash == "" || !s.isTransferUsable(transfer) {
+		if transfer.PublicTokenHash == "" || transfer.Target != TargetBrowserLink || !s.isTransferUsable(transfer) {
 			continue
 		}
 		ok, err := s.verifier.VerifyStoredToken(rawToken, transfer.PublicTokenHash)
@@ -117,8 +131,74 @@ func (s *Service) VerifyPublicToken(ctx context.Context, rawToken string) (Trans
 	return TransferSession{}, ErrSessionNotFound
 }
 
+func (s *Service) IssueBrowserReceiverTicket(ctx context.Context, rawPublicToken string, consent ReceiverConsent) (BrowserReceiverTicket, error) {
+	if !consent.Accepted {
+		return BrowserReceiverTicket{}, ErrReceiverConsentRequired
+	}
+	transfer, err := s.VerifyPublicToken(ctx, rawPublicToken)
+	if err != nil {
+		return BrowserReceiverTicket{}, err
+	}
+	if transfer.PasswordHash != nil {
+		if consent.Password == "" {
+			return BrowserReceiverTicket{}, ErrReceiverPasswordRequired
+		}
+		ok, err := s.verifier.VerifyStoredToken(consent.Password, *transfer.PasswordHash)
+		if err != nil || !ok {
+			return BrowserReceiverTicket{}, ErrReceiverPasswordInvalid
+		}
+	}
+	now := s.now()
+	expiresAt := now.Add(receiverTicketTTL)
+	if transfer.ExpiresAt.Before(expiresAt) {
+		expiresAt = transfer.ExpiresAt
+	}
+	storedTicket := s.tokens.NewReceiverTicket(transfer.ID)
+	updated, err := s.repo.Update(ctx, transfer.ID, func(session *TransferSession) error {
+		if session.Target != TargetBrowserLink || !s.isTransferUsable(*session) {
+			return ErrSessionNotFound
+		}
+		session.ReceiverTicketHash = storedTicket.Stored
+		session.ReceiverTicketExpiresAt = cloneTime(expiresAt)
+		return nil
+	})
+	if err != nil {
+		return BrowserReceiverTicket{}, err
+	}
+	return BrowserReceiverTicket{Transfer: updated, ReceiverTicket: storedTicket.Raw, ExpiresAt: expiresAt}, nil
+}
+
+func (s *Service) VerifyBrowserReceiverTicket(ctx context.Context, rawPublicToken string, rawTicket string) (TransferSession, error) {
+	transfer, err := s.VerifyPublicToken(ctx, rawPublicToken)
+	if err != nil {
+		return TransferSession{}, err
+	}
+	if transfer.ReceiverTicketHash == "" || transfer.ReceiverTicketExpiresAt == nil {
+		return TransferSession{}, ErrReceiverTicketNotIssued
+	}
+	if !s.now().Before(*transfer.ReceiverTicketExpiresAt) {
+		return TransferSession{}, auth.ErrTicketExpired
+	}
+	ok, err := s.verifier.VerifyStoredToken(receiverTicketBindingRaw(rawTicket, transfer.ID), transfer.ReceiverTicketHash)
+	if err != nil || !ok {
+		return TransferSession{}, auth.ErrTicketInvalid
+	}
+	return transfer, nil
+}
+
 func (s *Service) ListActive(ctx context.Context) ([]TransferSession, error) {
 	return s.repo.ListActive(ctx)
+}
+
+func (s *Service) VerifyTransferUsable(ctx context.Context, transferID string) (TransferSession, error) {
+	transfer, err := s.repo.Get(ctx, transferID)
+	if err != nil {
+		return TransferSession{}, err
+	}
+	if !s.isTransferUsable(transfer) {
+		return TransferSession{}, ErrSessionNotFound
+	}
+	return transfer, nil
 }
 
 func (s *Service) isTransferUsable(transfer TransferSession) bool {
@@ -197,6 +277,22 @@ func (i RandomTokenIssuer) NewAgentTicket() StoredToken {
 		panic(fmt.Sprintf("hash agent ticket: %v", err))
 	}
 	return StoredToken{Raw: raw, Stored: stored}
+}
+
+func (i RandomTokenIssuer) NewReceiverTicket(transferID string) StoredToken {
+	raw, err := auth.GenerateToken("rt", 32)
+	if err != nil {
+		panic(fmt.Sprintf("generate receiver ticket: %v", err))
+	}
+	stored, err := auth.HashToken(receiverTicketBindingRaw(raw, transferID), i.pepper())
+	if err != nil {
+		panic(fmt.Sprintf("hash receiver ticket: %v", err))
+	}
+	return StoredToken{Raw: raw, Stored: stored}
+}
+
+func receiverTicketBindingRaw(raw string, transferID string) string {
+	return "browser_recipient:" + transferID + ":" + raw
 }
 
 func (i RandomTokenIssuer) pepper() string {

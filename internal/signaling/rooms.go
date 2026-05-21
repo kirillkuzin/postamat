@@ -14,11 +14,12 @@ type Peer interface {
 type DisconnectCallback func(transferID string, agentID string)
 
 type RoomManager struct {
-	mu           sync.RWMutex
-	presence     *PresenceRegistry
-	onDisconnect DisconnectCallback
-	peers        map[string]map[string]Peer
-	active       map[string]map[string]struct{}
+	mu            sync.RWMutex
+	presence      *PresenceRegistry
+	onDisconnect  DisconnectCallback
+	peers         map[string]map[string]Peer
+	transferPeers map[string]map[string]map[string]Peer
+	active        map[string]map[string]struct{}
 }
 
 func NewRoomManager(presence *PresenceRegistry, onDisconnect DisconnectCallback) *RoomManager {
@@ -26,10 +27,11 @@ func NewRoomManager(presence *PresenceRegistry, onDisconnect DisconnectCallback)
 		presence = NewPresenceRegistry(nil)
 	}
 	return &RoomManager{
-		presence:     presence,
-		onDisconnect: onDisconnect,
-		peers:        make(map[string]map[string]Peer),
-		active:       make(map[string]map[string]struct{}),
+		presence:      presence,
+		onDisconnect:  onDisconnect,
+		peers:         make(map[string]map[string]Peer),
+		transferPeers: make(map[string]map[string]map[string]Peer),
+		active:        make(map[string]map[string]struct{}),
 	}
 }
 
@@ -40,6 +42,22 @@ func (m *RoomManager) AttachPeer(agentID string, deviceID string, peer Peer) {
 		m.peers[agentID] = make(map[string]Peer)
 	}
 	m.peers[agentID][deviceID] = peer
+}
+
+func (m *RoomManager) AttachTransferPeer(agentID string, deviceID string, transferID string, peer Peer) {
+	if transferID == "" {
+		m.AttachPeer(agentID, deviceID, peer)
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.transferPeers[transferID] == nil {
+		m.transferPeers[transferID] = make(map[string]map[string]Peer)
+	}
+	if m.transferPeers[transferID][agentID] == nil {
+		m.transferPeers[transferID][agentID] = make(map[string]Peer)
+	}
+	m.transferPeers[transferID][agentID][deviceID] = peer
 }
 
 func (m *RoomManager) Route(envelope Envelope) error {
@@ -53,7 +71,16 @@ func (m *RoomManager) Route(envelope Envelope) error {
 	if targetAgentID == "" {
 		return ErrRouteTargetRequired
 	}
-	peer, ok := m.firstPeer(targetAgentID)
+	var peer Peer
+	var ok bool
+	if envelope.TransferID != "" {
+		peer, ok = m.firstTransferPeer(envelope.TransferID, targetAgentID)
+		if !ok {
+			peer, ok = m.firstPeer(targetAgentID)
+		}
+	} else {
+		peer, ok = m.firstPeer(targetAgentID)
+	}
 	if !ok {
 		return ErrAgentOffline
 	}
@@ -84,7 +111,10 @@ func (m *RoomManager) detach(agentID string, deviceID string, peer Peer) {
 			delete(m.peers, agentID)
 		}
 	}
-	stillOnline := len(m.peers[agentID]) > 0
+	if m.detachTransferPeerLocked(agentID, deviceID, peer) {
+		removed = true
+	}
+	stillOnline := len(m.peers[agentID]) > 0 || m.hasTransferPeerLocked(agentID)
 	if removed && !stillOnline {
 		for transferID, agents := range m.active {
 			if _, ok := agents[agentID]; ok {
@@ -105,10 +135,50 @@ func (m *RoomManager) detach(agentID string, deviceID string, peer Peer) {
 	}
 }
 
+func (m *RoomManager) detachTransferPeerLocked(agentID string, deviceID string, peer Peer) bool {
+	removed := false
+	for transferID, agents := range m.transferPeers {
+		devices := agents[agentID]
+		if devices == nil {
+			continue
+		}
+		if peer == nil || devices[deviceID] == peer {
+			delete(devices, deviceID)
+			removed = true
+		}
+		if len(devices) == 0 {
+			delete(agents, agentID)
+		}
+		if len(agents) == 0 {
+			delete(m.transferPeers, transferID)
+		}
+	}
+	return removed
+}
+
+func (m *RoomManager) hasTransferPeerLocked(agentID string) bool {
+	for _, agents := range m.transferPeers {
+		if len(agents[agentID]) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *RoomManager) firstPeer(agentID string) (Peer, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	devices := m.peers[agentID]
+	for _, peer := range devices {
+		return peer, true
+	}
+	return nil, false
+}
+
+func (m *RoomManager) firstTransferPeer(transferID string, agentID string) (Peer, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	devices := m.transferPeers[transferID][agentID]
 	for _, peer := range devices {
 		return peer, true
 	}

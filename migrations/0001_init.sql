@@ -36,6 +36,8 @@ CREATE TABLE transfers (
     to_agent_id TEXT REFERENCES agents(id),
     public_token_hash TEXT,
     agent_ticket_hash TEXT NOT NULL UNIQUE,
+    receiver_ticket_hash TEXT,
+    receiver_ticket_expires_at TIMESTAMPTZ,
     file_name TEXT NOT NULL,
     file_size_bytes BIGINT NOT NULL CHECK (file_size_bytes >= 0),
     file_sha256 TEXT,

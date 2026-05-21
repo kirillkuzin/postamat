@@ -27,7 +27,7 @@ func TestTransferRepositorySaveInsertsAllPersistedFields(t *testing.T) {
 	if got, want := db.execArgs[0], session.ID; got != want {
 		t.Fatalf("first arg = %v, want transfer id %v", got, want)
 	}
-	if got, want := db.execArgs[13], session.MaxDownloads; got != want {
+	if got, want := db.execArgs[15], session.MaxDownloads; got != want {
 		t.Fatalf("max_downloads arg = %v, want %v", got, want)
 	}
 }
@@ -39,6 +39,8 @@ func TestTransferRepositorySaveMapsOptionalEmptyFieldsToNull(t *testing.T) {
 	session.Target = sessions.TargetBrowserLink
 	session.ToAgentID = ""
 	session.PublicTokenHash = "public_hash"
+	session.ReceiverTicketHash = ""
+	session.ReceiverTicketExpiresAt = nil
 	session.FileSHA256 = ""
 	session.MimeType = ""
 	session.FailureReason = ""
@@ -46,7 +48,7 @@ func TestTransferRepositorySaveMapsOptionalEmptyFieldsToNull(t *testing.T) {
 	if err := repo.Save(context.Background(), session); err != nil {
 		t.Fatalf("Save returned error: %v", err)
 	}
-	for _, idx := range []int{5, 10, 11, 21} {
+	for _, idx := range []int{5, 8, 9, 12, 13, 23} {
 		if db.execArgs[idx] != nil {
 			t.Fatalf("arg %d = %#v, want SQL NULL", idx, db.execArgs[idx])
 		}
@@ -122,35 +124,38 @@ func sampleTransferSession() sessions.TransferSession {
 	failedAt := time.Date(2026, 5, 20, 12, 20, 0, 0, time.UTC)
 	cancelledAt := time.Date(2026, 5, 20, 12, 30, 0, 0, time.UTC)
 	expiredAt := time.Date(2026, 5, 20, 12, 40, 0, 0, time.UTC)
+	receiverTicketExpiresAt := time.Date(2026, 5, 20, 12, 5, 0, 0, time.UTC)
 	passwordHash := "pwd_hash"
 	return sessions.TransferSession{
-		ID:              "tr_123",
-		Transport:       sessions.TransportWebRTCP2P,
-		Target:          sessions.TargetAgent,
-		Status:          sessions.StatusCreated,
-		FromAgentID:     "agent-a",
-		ToAgentID:       "agent-b",
-		PublicTokenHash: "public_hash",
-		AgentTicketHash: "agent_ticket_hash",
-		FileName:        "file.txt",
-		FileSizeBytes:   42,
-		FileSHA256:      "sha256",
-		MimeType:        "text/plain",
-		ExpiresAt:       time.Date(2026, 5, 20, 13, 0, 0, 0, time.UTC),
-		MaxDownloads:    1,
-		DownloadCount:   0,
-		PasswordHash:    &passwordHash,
-		CreatedAt:       time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC),
-		CompletedAt:     &completedAt,
-		FailedAt:        &failedAt,
-		CancelledAt:     &cancelledAt,
-		ExpiredAt:       &expiredAt,
-		FailureReason:   "reason",
+		ID:                      "tr_123",
+		Transport:               sessions.TransportWebRTCP2P,
+		Target:                  sessions.TargetAgent,
+		Status:                  sessions.StatusCreated,
+		FromAgentID:             "agent-a",
+		ToAgentID:               "agent-b",
+		PublicTokenHash:         "public_hash",
+		AgentTicketHash:         "agent_ticket_hash",
+		ReceiverTicketHash:      "receiver_ticket_hash",
+		ReceiverTicketExpiresAt: &receiverTicketExpiresAt,
+		FileName:                "file.txt",
+		FileSizeBytes:           42,
+		FileSHA256:              "sha256",
+		MimeType:                "text/plain",
+		ExpiresAt:               time.Date(2026, 5, 20, 13, 0, 0, 0, time.UTC),
+		MaxDownloads:            1,
+		DownloadCount:           0,
+		PasswordHash:            &passwordHash,
+		CreatedAt:               time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC),
+		CompletedAt:             &completedAt,
+		FailedAt:                &failedAt,
+		CancelledAt:             &cancelledAt,
+		ExpiredAt:               &expiredAt,
+		FailureReason:           "reason",
 	}
 }
 
 func sessionRowValues(s sessions.TransferSession) []any {
-	return []any{s.ID, s.Transport, s.Target, s.Status, s.FromAgentID, sqlString(s.ToAgentID), sqlString(s.PublicTokenHash), s.AgentTicketHash, s.FileName, s.FileSizeBytes, sqlString(s.FileSHA256), sqlString(s.MimeType), s.ExpiresAt, s.MaxDownloads, s.DownloadCount, s.PasswordHash, s.CreatedAt, s.CompletedAt, s.FailedAt, s.CancelledAt, s.ExpiredAt, sqlString(s.FailureReason)}
+	return []any{s.ID, s.Transport, s.Target, s.Status, s.FromAgentID, sqlString(s.ToAgentID), sqlString(s.PublicTokenHash), s.AgentTicketHash, sqlString(s.ReceiverTicketHash), s.ReceiverTicketExpiresAt, s.FileName, s.FileSizeBytes, sqlString(s.FileSHA256), sqlString(s.MimeType), s.ExpiresAt, s.MaxDownloads, s.DownloadCount, s.PasswordHash, s.CreatedAt, s.CompletedAt, s.FailedAt, s.CancelledAt, s.ExpiredAt, sqlString(s.FailureReason)}
 }
 
 func sqlString(value string) sql.NullString {

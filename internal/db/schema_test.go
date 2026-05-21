@@ -28,6 +28,8 @@ func TestInitialMigrationDefinesImportantConstraintsAndIndexes(t *testing.T) {
 		"CREATE UNIQUE INDEX idx_transfers_public_token_hash_unique",
 		"event_type IN ('transfer.created'",
 		"agent_ticket_hash TEXT NOT NULL UNIQUE",
+		"receiver_ticket_hash TEXT",
+		"receiver_ticket_expires_at TIMESTAMPTZ",
 		"raw_token",
 	}
 	for _, check := range checks {
