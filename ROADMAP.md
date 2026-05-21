@@ -13,13 +13,13 @@ This roadmap describes public project gaps and directions. It is not a release p
 - PostgreSQL-compatible repositories and migrations for metadata/audit state.
 - CI that builds frontend assets before Go tests, race tests, vet, coverage, and command builds.
 - Deployment preview with Dockerfile, Compose, Caddy, coturn, `/healthz`, and `/metrics`.
+- CLI and MCP adapter over local `agentd` for create/status/cancel/list/inbox control-plane operations.
 
 ## Open work
 
 ### Product and protocol completeness
 
-- End-to-end browser receive implementation beyond signaling display.
-- CLI UX for initiating, accepting, listing, and cancelling transfers.
+- Polished end-to-end browser receive implementation beyond signaling display.
 - Durable transfer progress reporting across daemon restarts.
 - Better failure taxonomy: transport failure, policy denial, expiry, cancellation, integrity failure.
 - Large-file reliability: ACKs, resume, retry windows, and partial-file cleanup.
