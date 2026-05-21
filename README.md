@@ -1,99 +1,82 @@
 # postamat
 
+[![CI](https://github.com/kirillkuzin/postamat/actions/workflows/ci.yml/badge.svg)](https://github.com/kirillkuzin/postamat/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-postamat is an agent-native secure transfer control plane. The MVP lets online AI agents transfer files/data to other agents through Magic-Wormhole-like one-time WebRTC P2P sessions. A browser recipient link remains supported as an adapter flow.
+postamat is an open-source, agent-native secure transfer system. It coordinates transfer intent, agent presence, policy, audit, and WebRTC signaling while file bytes move directly between endpoints over encrypted WebRTC DataChannels.
 
-The server coordinates transfer intent, agent presence, policy, audit, and WebRTC signaling. File bytes are streamed from local `postamat agentd` to another `agentd` or browser over WebRTC DataChannel, with application-level end-to-end encryption from the first release.
+The project is designed for self-hosting and for automation-first clients: local `postamat agentd` daemons, a human-facing CLI, browser recipient links, and future protocol adapters all use the same REST/WebSocket control plane.
 
-> Status: early skeleton. The repository is not usable as a product yet.
+> Status: active development. Core server, daemon, signaling, P2P chunking, and encryption foundations are in place, but polished end-user flows, deployment packaging, and stable APIs are still under implementation. Security reviews and design feedback are welcome.
 
-## Goals
+## Project foundation
 
-- Go backend for transfer lifecycle, agent identity, policy, signaling, audit, and public recipient UI.
-- Local `postamat agentd` near each agent for long-running bidirectional P2P transfers.
-- Agent-to-agent transfer as the primary MVP flow.
-- Browser `/p/{token}` recipient flow as an adapter.
-- REST + WebSocket as the canonical backend protocol.
-- MCP adapter as a control plane to local `agentd`.
-- Self-hosted deployment with PostgreSQL, coturn, and a TLS reverse proxy.
+The repository currently contains the foundations for:
 
-## MVP scope
+- agent-to-agent secure transfers through local `postamat agentd` daemons;
+- browser `/p/{token}` recipient flow and signaling path;
+- application-level end-to-end encryption for transferred chunks;
+- backend-visible coordination metadata: transfer intent, lifecycle state, routing, policy, transient signaling, and audit events;
+- canonical REST + WebSocket backend protocol;
+- WebRTC DataChannel data plane with explicit chunk frames, backpressure handling, manifests, and SHA-256 integrity validation;
+- self-hostable backend architecture with PostgreSQL-oriented persistence and room for TURN/TLS deployment assets;
+- open-source project workflow: CI, contribution guide, security policy, issue templates, governance, and roadmap.
 
-Included:
+## Architecture
 
-- WebRTC P2P transfer from online `agentd A` to online `agentd B`.
-- Agent WSS presence and incoming transfer offers.
-- Agent REST API for create/status/list/cancel.
-- Receiver policy hooks and local inbox.
-- Public `/p/{token}` recipient flow.
-- SDP/ICE signaling over WSS.
-- TTL, cancel/revoke, transfer failure/expiry handling.
-- Metadata/audit storage only; no server-side plaintext file storage.
-- Explicit lifecycle states and MVP failure behavior: if `agentd` dies during connection or transfer, the transfer fails and a new one must be created.
+The short version:
 
-Not included in the MVP:
+```mermaid
+flowchart LR
+  agentA[Agent A] --> daemonA[postamat agentd A]
+  agentB[Agent B] --> daemonB[postamat agentd B]
+  human[Browser recipient] --> browser[/p/{token}]
 
-- Stored/offline encrypted blob fallback.
-- Reverse upload.
-- Human short-code CLI mode.
-- Large-file resume/chunk ACKs.
-- Enterprise IAM, billing, DLP, mobile apps.
+  daemonA <-->|REST + WSS control| backend[postamat server]
+  daemonB <-->|Outbound WSS control| backend
+  browser <-->|WSS signaling| backend
+  backend --> db[(PostgreSQL metadata + audit)]
 
-## Architecture sketch
-
-```text
-Agent A -> postamat agentd A -> backend REST/WSS
-Agent B -> postamat agentd B --outbound WSS--> backend
-
-Signaling/control:
-agentd A <---WSS---> backend <---WSS---> agentd B
-
-File path:
-agentd A ==E2E encrypted chunks over WebRTC DataChannel==> agentd B
-
-Browser adapter:
-agentd A ==E2E encrypted chunks over WebRTC DataChannel==> browser /p/{token}
-
-MVP lifecycle:
-created -> offered -> accepted -> connecting -> transferring -> completed
-terminal: failed, cancelled, expired
+  daemonA ==>|E2E encrypted WebRTC chunks| daemonB
+  daemonA ==>|E2E encrypted WebRTC chunks| browser
 ```
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full project architecture: components, trust boundaries, control plane, data plane, transfer lifecycle, storage model, and deployment view.
 
 ## Repository layout
 
 ```text
 cmd/
-  postamat/      CLI entrypoint placeholder
-  agentd/        agent daemon entrypoint placeholder
-  server/        backend server entrypoint placeholder
+  postamat/       CLI entrypoint
+  agentd/         local agent daemon entrypoint
+  server/         backend server entrypoint
 internal/
-  app/           application command wiring
-  config/        defaults and config model
-  sessions/      transfer session domain model
-  api/           REST/WebSocket handlers
-  auth/          tokens, tickets, scopes
-  agents/        agent identity and capabilities
-  crypto/        E2E chunk encryption protocol
-  db/            repositories and migrations
-  p2p/           WebRTC P2P orchestration
-  policy/        transfer policy checks
-  signaling/     WSS rooms, presence, SDP/ICE routing
-  agentd/        local daemon runtime
-  integrations/  MCP/ACP adapters
-migrations/      database migrations
-web/recipient/   browser-recipient frontend source; dist is generated and ignored
-deployments/     Docker Compose and reverse proxy config
-docs/            project documentation
+  agentd/         local daemon API, job state, backend client, inbox, Unix socket server
+  agents/         agent identity, device registration, capabilities
+  api/            REST routes, public recipient routes, WebSocket handlers
+  app/            command wiring
+  audit/          audit event model and redaction
+  auth/           bearer tokens, transfer tickets, scoped identities
+  build/          build/CI invariants
+  config/         default configuration
+  crypto/         reserved package for shared crypto primitives
+  db/             PostgreSQL-compatible repositories and schema tests
+  integrations/   protocol adapters such as MCP/ACP
+  p2p/            WebRTC transport, chunk protocol, E2E encryption, sender/receiver
+  sessions/       transfer lifecycle domain model and repositories
+  signaling/      presence registry, rooms, SDP/ICE envelope routing
+  web/            reserved package for embedded web assets
+  worker/         reserved package for background workers
+migrations/       database migrations
+web/recipient/    browser-recipient frontend source; dist is generated and ignored
+deployments/      deployment manifests and reverse-proxy/TURN examples as they land
 ```
-
-Some directories are placeholders until their first tested implementation lands.
 
 ## Development
 
 Requirements:
 
-- Go 1.26.3 or newer compatible toolchain. Use latest stable Go and latest stable dependencies at implementation time.
+- Go 1.26.3 or newer compatible toolchain. Use the latest stable Go and latest stable dependencies at implementation time.
 - Node.js 22 and npm for the browser-recipient frontend build.
 
 Run full local verification:
@@ -110,7 +93,7 @@ Run Go tests only:
 go test ./...
 ```
 
-Build skeleton binaries:
+Build commands:
 
 ```bash
 go build ./cmd/server
@@ -118,14 +101,26 @@ go build ./cmd/agentd
 go build ./cmd/postamat
 ```
 
+## Contributing
+
+postamat is an open-source project and welcomes issues, design discussion, documentation improvements, tests, and pull requests.
+
+Start with:
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) for local workflow and PR expectations.
+- [SECURITY.md](SECURITY.md) for vulnerability reporting and security invariants.
+- [ROADMAP.md](ROADMAP.md) for current capabilities and open project gaps.
+- [GOVERNANCE.md](GOVERNANCE.md) for maintainer and decision-making policy.
+- [SUPPORT.md](SUPPORT.md) for where to ask questions.
+
 ## Development approach
 
-This project is developed test-first where possible:
+Behavior changes should be test-first where practical:
 
-1. Write a failing test for the next behavior.
-2. Run it and verify the expected failure.
-3. Implement the smallest code that passes.
-4. Run the full test suite.
+1. Add or update a failing test for the intended behavior.
+2. Verify the test fails for the expected reason.
+3. Implement the smallest coherent change.
+4. Run focused tests and then `make verify`.
 5. Refactor with tests green.
 
 ## License

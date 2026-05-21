@@ -7,7 +7,7 @@ import (
 	"github.com/kirillkuzin/postamat/internal/config"
 )
 
-func TestDefaultsAreSafeForP2PMVP(t *testing.T) {
+func TestDefaultsAreSafeForP2PTransfers(t *testing.T) {
 	cfg := config.Defaults()
 
 	if cfg.DefaultP2PTTL != 30*time.Minute {

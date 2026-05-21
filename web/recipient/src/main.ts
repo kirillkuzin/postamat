@@ -239,14 +239,14 @@ function handleSignalingMessage(ws: WebSocket, transfer: PublicTransfer, browser
         logEvent('Ignored WebRTC offer outside this transfer.')
         return
       }
-      logEvent('WebRTC offer received; answer/data-channel handling arrives in Milestone 8.')
+      logEvent('WebRTC offer received; browser data-channel receive is still under implementation.')
       break
     case 'webrtc.ice':
       if (!isExpectedSenderEnvelope(envelope, transfer, browserAgentID)) {
         logEvent('Ignored ICE candidate outside this transfer.')
         return
       }
-      logEvent('ICE candidate received; WebRTC handling arrives in Milestone 8.')
+      logEvent('ICE candidate received for pending browser data-channel implementation.')
       break
     case 'error':
       setStatus('Signaling error received.')

@@ -1,0 +1,32 @@
+name: Feature request
+description: Propose a capability, protocol improvement, or operational enhancement
+title: "feat: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user or operator problem should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the desired behavior and any API/CLI implications.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and privacy considerations
+      description: Does this affect keys, tokens, WebRTC signaling, local files, logs, browser URL fragments, or backend-visible metadata?
+    validations:
+      required: true
