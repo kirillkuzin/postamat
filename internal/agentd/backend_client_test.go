@@ -296,6 +296,102 @@ func TestBackendLoopHandlesConcurrentDuplicateOffersIdempotently(t *testing.T) {
 	}
 }
 
+func TestBackendLoopDeniesOfferByReceivePolicyBeforeInboxReservation(t *testing.T) {
+	manager := NewJobManager(nil)
+	inbox := NewInbox(t.TempDir(), nil)
+	loop := NewBackendLoop(BackendLoopOptions{
+		AgentID:       "agent-b",
+		DeviceID:      "dev-1",
+		Jobs:          manager,
+		Inbox:         inbox,
+		Client:        NewBackendClient("https://postamat.example", nil),
+		ReceivePolicy: ReceivePolicy{AllowedFromAgentIDs: []string{"trusted-agent"}, MaxFileSizeBytes: 10},
+	})
+	envelope := signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: "tr_denied", FromAgentID: "agent-a", ToAgentID: "agent-b", Payload: json.RawMessage(`{"file_name":"payload.bin","file_size_bytes":99}`)}
+
+	if err := loop.HandleEnvelope(context.Background(), envelope); !errors.Is(err, ErrOfferDeniedByPolicy) {
+		t.Fatalf("HandleEnvelope error = %v, want ErrOfferDeniedByPolicy", err)
+	}
+	if _, ok := manager.FindByTransferID("tr_denied"); ok {
+		t.Fatal("policy-denied offer created a receive job")
+	}
+	if entries := inbox.List(); len(entries) != 0 {
+		t.Fatalf("policy-denied offer reserved inbox entries: %+v", entries)
+	}
+}
+
+func TestBackendLoopWritesAcceptedOrDeniedDecisionOverWebSocket(t *testing.T) {
+	tests := []struct {
+		name     string
+		policy   ReceivePolicy
+		fileSize int64
+		wantType signaling.MessageType
+		wantJob  bool
+	}{
+		{name: "accepted", policy: ReceivePolicy{AllowedFromAgentIDs: []string{"agent-a"}, MaxFileSizeBytes: 64}, fileSize: 42, wantType: signaling.MessageTransferAccepted, wantJob: true},
+		{name: "denied", policy: ReceivePolicy{AllowedFromAgentIDs: []string{"agent-a"}, MaxFileSizeBytes: 10}, fileSize: 42, wantType: signaling.MessageTransferDenied, wantJob: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			messages := make(chan signaling.Envelope, 3)
+			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				conn, err := upgrader.Upgrade(w, req, nil)
+				if err != nil {
+					t.Fatalf("upgrade: %v", err)
+				}
+				defer conn.Close()
+				var hello signaling.Envelope
+				if err := conn.ReadJSON(&hello); err != nil {
+					t.Fatalf("read hello: %v", err)
+				}
+				messages <- hello
+				offerPayload, _ := json.Marshal(map[string]any{"file_name": "payload.bin", "file_size_bytes": tt.fileSize})
+				if err := conn.WriteJSON(signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: "tr_policy", FromAgentID: "agent-a", ToAgentID: "agent-b", Payload: offerPayload}); err != nil {
+					t.Fatalf("write offer: %v", err)
+				}
+				var decision signaling.Envelope
+				if err := conn.ReadJSON(&decision); err != nil {
+					t.Fatalf("read decision: %v", err)
+				}
+				messages <- decision
+			}))
+			defer server.Close()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			manager := NewJobManager(nil)
+			loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-1", Jobs: manager, Inbox: NewInbox(t.TempDir(), nil), Client: NewBackendClient(server.URL, server.Client()), ReceivePolicy: tt.policy})
+			runErr := make(chan error, 1)
+			go func() {
+				runErr <- loop.RunTransfer(ctx, Job{Direction: JobDirectionReceive, TransferID: "tr_policy", AgentTicket: "ticket-b"})
+			}()
+
+			hello := readSignalingMessage(t, messages, "hello")
+			if hello.Type != signaling.MessageAgentHello || hello.AgentID != "agent-b" || hello.TransferID != "tr_policy" {
+				t.Fatalf("unexpected hello: %+v", hello)
+			}
+			decision := readSignalingMessage(t, messages, "decision")
+			if decision.Type != tt.wantType || decision.TransferID != "tr_policy" || decision.FromAgentID != "agent-b" || decision.ToAgentID != "agent-a" {
+				t.Fatalf("unexpected decision: %+v", decision)
+			}
+			_, ok := manager.FindByTransferID("tr_policy")
+			if ok != tt.wantJob {
+				t.Fatalf("receive job presence = %v, want %v", ok, tt.wantJob)
+			}
+			cancel()
+			select {
+			case err := <-runErr:
+				if err != nil && ctx.Err() == nil {
+					t.Fatalf("RunTransfer returned error: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("RunTransfer did not stop after context cancellation")
+			}
+		})
+	}
+}
+
 func writeJSONForTest(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

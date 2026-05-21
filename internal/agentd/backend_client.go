@@ -20,6 +20,7 @@ var (
 	ErrBackendURLRequired     = errors.New("backend URL is required")
 	ErrBackendClientRequired  = errors.New("backend client is required")
 	ErrOfferRecipientMismatch = errors.New("offer recipient does not match local agent")
+	ErrOfferDeniedByPolicy    = errors.New("offer denied by receive policy")
 )
 
 type BackendClient struct {
@@ -127,20 +128,60 @@ func (c *BackendClient) resolve(path string) url.URL {
 }
 
 type BackendLoopOptions struct {
-	AgentID  string
-	DeviceID string
-	Jobs     *JobManager
-	Inbox    *Inbox
-	Client   *BackendClient
+	AgentID       string
+	DeviceID      string
+	Jobs          *JobManager
+	Inbox         *Inbox
+	Client        *BackendClient
+	ReceivePolicy ReceivePolicy
+}
+
+type ReceivePolicy struct {
+	AllowedFromAgentIDs []string
+	MaxFileSizeBytes    int64
+	DenyAll             bool
+}
+
+type transferOfferPayload struct {
+	FileName      string `json:"file_name"`
+	FileSizeBytes int64  `json:"file_size_bytes"`
+}
+
+type receivePolicyDecision struct {
+	Accepted bool
+	Reason   string
+}
+
+func (p ReceivePolicy) Evaluate(fromAgentID string, offer transferOfferPayload) receivePolicyDecision {
+	if p.DenyAll {
+		return receivePolicyDecision{Accepted: false, Reason: "receive_policy_denies_all"}
+	}
+	if len(p.AllowedFromAgentIDs) > 0 {
+		allowed := false
+		for _, candidate := range p.AllowedFromAgentIDs {
+			if candidate == fromAgentID {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return receivePolicyDecision{Accepted: false, Reason: "sender_not_allowed"}
+		}
+	}
+	if p.MaxFileSizeBytes > 0 && offer.FileSizeBytes > p.MaxFileSizeBytes {
+		return receivePolicyDecision{Accepted: false, Reason: "file_size_exceeds_receive_policy"}
+	}
+	return receivePolicyDecision{Accepted: true}
 }
 
 type BackendLoop struct {
-	mu       sync.Mutex
-	agentID  string
-	deviceID string
-	jobs     *JobManager
-	inbox    *Inbox
-	client   *BackendClient
+	mu            sync.Mutex
+	agentID       string
+	deviceID      string
+	jobs          *JobManager
+	inbox         *Inbox
+	client        *BackendClient
+	receivePolicy ReceivePolicy
 }
 
 func NewBackendLoop(options BackendLoopOptions) *BackendLoop {
@@ -148,7 +189,7 @@ func NewBackendLoop(options BackendLoopOptions) *BackendLoop {
 	if jobs == nil {
 		jobs = NewJobManager(nil)
 	}
-	return &BackendLoop{agentID: options.AgentID, deviceID: options.DeviceID, jobs: jobs, inbox: options.Inbox, client: options.Client}
+	return &BackendLoop{agentID: options.AgentID, deviceID: options.DeviceID, jobs: jobs, inbox: options.Inbox, client: options.Client, receivePolicy: options.ReceivePolicy}
 }
 
 func (l *BackendLoop) CreateSendTransfer(ctx context.Context, input CreateSendJobInput) (Job, error) {
@@ -206,7 +247,7 @@ func (l *BackendLoop) RunTransfer(ctx context.Context, job Job) error {
 		if envelope.TransferID != "" && envelope.TransferID != job.TransferID {
 			return ErrOfferRecipientMismatch
 		}
-		if err := l.HandleEnvelope(ctx, envelope); err != nil {
+		if err := l.handleEnvelope(ctx, func(reply signaling.Envelope) error { return conn.WriteJSON(reply) }, envelope); err != nil {
 			return err
 		}
 	}
@@ -244,38 +285,16 @@ func (l *BackendLoop) SendHeartbeat(conn *websocket.Conn) error {
 }
 
 func (l *BackendLoop) HandleEnvelope(ctx context.Context, envelope signaling.Envelope) error {
+	return l.handleEnvelope(ctx, nil, envelope)
+}
+
+func (l *BackendLoop) handleEnvelope(ctx context.Context, send func(signaling.Envelope) error, envelope signaling.Envelope) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	switch envelope.Type {
 	case signaling.MessageTransferOffer:
-		l.mu.Lock()
-		defer l.mu.Unlock()
-		if envelope.ToAgentID != l.agentID {
-			return ErrOfferRecipientMismatch
-		}
-		if _, ok := l.jobs.FindByTransferID(envelope.TransferID); ok {
-			return nil
-		}
-		var payload struct {
-			FileName      string `json:"file_name"`
-			FileSizeBytes int64  `json:"file_size_bytes"`
-		}
-		if len(envelope.Payload) > 0 {
-			if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
-				return err
-			}
-		}
-		destinationPath := ""
-		if l.inbox != nil {
-			entry, err := l.inbox.Reserve(InboxOffer{TransferID: envelope.TransferID, FromAgentID: envelope.FromAgentID, FileName: payload.FileName, FileSizeBytes: payload.FileSizeBytes})
-			if err != nil {
-				return err
-			}
-			destinationPath = entry.DestinationPath
-		}
-		_, err := l.jobs.CreateReceiveJob(CreateReceiveJobInput{TransferID: envelope.TransferID, FromAgentID: envelope.FromAgentID, FileName: payload.FileName, FileSizeBytes: payload.FileSizeBytes, DestinationPath: destinationPath})
-		return err
+		return l.handleTransferOffer(send, envelope)
 	case signaling.MessageTransferAccepted:
 		return l.updateTransferJob(envelope.TransferID, l.jobs.MarkAccepted)
 	case signaling.MessageTransferStarted:
@@ -314,6 +333,67 @@ func (l *BackendLoop) HandleEnvelope(ctx context.Context, envelope signaling.Env
 	default:
 		return nil
 	}
+}
+
+func (l *BackendLoop) handleTransferOffer(send func(signaling.Envelope) error, envelope signaling.Envelope) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if envelope.ToAgentID != l.agentID {
+		return ErrOfferRecipientMismatch
+	}
+	if _, ok := l.jobs.FindByTransferID(envelope.TransferID); ok {
+		return l.sendOfferDecision(send, envelope, true, "")
+	}
+	var payload transferOfferPayload
+	if len(envelope.Payload) > 0 {
+		if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
+			return err
+		}
+	}
+	decision := l.receivePolicy.Evaluate(envelope.FromAgentID, payload)
+	if !decision.Accepted {
+		if err := l.sendOfferDecision(send, envelope, false, decision.Reason); err != nil {
+			return err
+		}
+		if send != nil {
+			return nil
+		}
+		return ErrOfferDeniedByPolicy
+	}
+	destinationPath := ""
+	if l.inbox != nil {
+		entry, err := l.inbox.Reserve(InboxOffer{TransferID: envelope.TransferID, FromAgentID: envelope.FromAgentID, FileName: payload.FileName, FileSizeBytes: payload.FileSizeBytes})
+		if err != nil {
+			return err
+		}
+		destinationPath = entry.DestinationPath
+	}
+	job, err := l.jobs.CreateReceiveJob(CreateReceiveJobInput{TransferID: envelope.TransferID, FromAgentID: envelope.FromAgentID, FileName: payload.FileName, FileSizeBytes: payload.FileSizeBytes, DestinationPath: destinationPath})
+	if err != nil {
+		return err
+	}
+	if _, err := l.jobs.MarkAccepted(job.ID); err != nil {
+		return err
+	}
+	return l.sendOfferDecision(send, envelope, true, "")
+}
+
+func (l *BackendLoop) sendOfferDecision(send func(signaling.Envelope) error, offer signaling.Envelope, accepted bool, reason string) error {
+	if send == nil {
+		return nil
+	}
+	decision := signaling.Envelope{Type: signaling.MessageTransferAccepted, TransferID: offer.TransferID, FromAgentID: l.agentID, ToAgentID: offer.FromAgentID}
+	if !accepted {
+		decision.Type = signaling.MessageTransferDenied
+		if reason != "" {
+			payload, err := json.Marshal(map[string]string{"reason": reason})
+			if err != nil {
+				return err
+			}
+			decision.Payload = payload
+		}
+	}
+	return send(decision)
 }
 
 func (l *BackendLoop) updateTransferJob(transferID string, update func(string) (Job, error)) error {
