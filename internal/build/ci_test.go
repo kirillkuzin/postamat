@@ -54,6 +54,22 @@ func TestMakeVerifyBuildsFrontendBeforeGoChecks(t *testing.T) {
 	)
 }
 
+func TestFocusedRaceChecksIncludeP2PPackage(t *testing.T) {
+	makefileData, err := os.ReadFile("../../Makefile")
+	if err != nil {
+		t.Fatalf("read Makefile: %v", err)
+	}
+	workflowData, err := os.ReadFile("../../.github/workflows/ci.yml")
+	if err != nil {
+		t.Fatalf("read ci workflow: %v", err)
+	}
+	for name, text := range map[string]string{"Makefile": string(makefileData), "ci.yml": string(workflowData)} {
+		if !strings.Contains(text, "./internal/p2p") {
+			t.Fatalf("%s focused race checks must include ./internal/p2p", name)
+		}
+	}
+}
+
 func TestGitHubActionsBuildsFrontendBeforeGoChecks(t *testing.T) {
 	data, err := os.ReadFile("../../.github/workflows/ci.yml")
 	if err != nil {

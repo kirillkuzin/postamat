@@ -26,7 +26,7 @@ go-coverage: go-test
 	go tool cover -func=coverage.out | tee coverage.txt
 
 go-race: go-coverage
-	go test -race ./internal/agentd ./internal/auth ./internal/agents ./internal/sessions ./internal/api ./internal/audit ./internal/db ./internal/signaling
+	go test -race ./internal/agentd ./internal/auth ./internal/agents ./internal/sessions ./internal/api ./internal/audit ./internal/db ./internal/signaling ./internal/p2p
 
 go-vet: go-race
 	go vet ./...
