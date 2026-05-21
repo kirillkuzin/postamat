@@ -1,0 +1,83 @@
+services:
+  postamat-server:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: postamat/server:local
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - POSTAMAT_HTTP_ADDR=:8080
+      - POSTAMAT_DATABASE_URL=postgres://postamat:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/postamat?sslmode=disable
+      - POSTAMAT_PUBLIC_BASE_URL=${POSTAMAT_PUBLIC_BASE_URL:?set POSTAMAT_PUBLIC_BASE_URL}
+      - POSTAMAT_TOKEN_PEPPER=${POSTAMAT_TOKEN_PEPPER:?set POSTAMAT_TOKEN_PEPPER}
+      - POSTAMAT_METRICS_PATH=/metrics
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=postamat
+      - POSTGRES_USER=postamat
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postamat-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postamat -d postamat"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  caddy:
+    image: caddy:2.11-alpine
+    restart: unless-stopped
+    depends_on:
+      postamat-server:
+        condition: service_healthy
+    environment:
+      - POSTAMAT_PUBLIC_HOST=${POSTAMAT_PUBLIC_HOST:?set POSTAMAT_PUBLIC_HOST}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    labels:
+      postamat.config: deployments/caddy/Caddyfile
+
+  coturn:
+    image: coturn/coturn:4.7.0-r0-alpine
+    restart: unless-stopped
+    environment:
+      - TURN_REALM=${TURN_REALM:?set TURN_REALM}
+      - TURN_STATIC_AUTH_SECRET=${TURN_STATIC_AUTH_SECRET:?set TURN_STATIC_AUTH_SECRET}
+    command:
+      - turnserver
+      - -c
+      - /etc/coturn/turnserver.conf
+      - --realm=${TURN_REALM:?set TURN_REALM}
+      - --static-auth-secret=${TURN_STATIC_AUTH_SECRET:?set TURN_STATIC_AUTH_SECRET}
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "49160-49200:49160-49200/udp"
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    labels:
+      postamat.config: deployments/coturn/turnserver.conf
+
+volumes:
+  postamat-postgres:
+  caddy-data:
+  caddy-config:

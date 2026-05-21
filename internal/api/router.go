@@ -51,6 +51,8 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		r.handleRecipientAsset(w, req)
 	case req.URL.Path == "/healthz":
 		r.handleHealthz(w, req)
+	case req.URL.Path == "/metrics":
+		r.handleMetrics(w, req)
 	case req.URL.Path == "/api/v1/transfers":
 		r.handleTransfers(w, req)
 	case strings.HasPrefix(req.URL.Path, "/api/v1/transfers/"):
@@ -70,6 +72,16 @@ func (r *Router) handleHealthz(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	_, _ = w.Write([]byte("ok\n"))
+}
+
+func (r *Router) handleMetrics(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write([]byte("# HELP postamat_build_info Static build information for the postamat service.\n# TYPE postamat_build_info gauge\npostamat_build_info{service=\"postamat\"} 1\n"))
 }
 
 func (r *Router) handleTransfers(w http.ResponseWriter, req *http.Request) {

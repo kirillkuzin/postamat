@@ -1,0 +1,9 @@
+.git
+.github
+coverage.out
+coverage.txt
+web/recipient/dist
+web/recipient/node_modules
+bin
+.env
+.env.*
