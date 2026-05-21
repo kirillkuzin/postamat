@@ -27,6 +27,8 @@ type SenderOptions struct {
 	ChunkSize         int
 	MaxBufferedAmount uint64
 	OnProgress        func(Progress)
+	Encryption        *ChunkCipher
+	AllowPlaintext    bool
 }
 
 func StreamReader(ctx context.Context, transferID string, source io.Reader, channel OutboundDataChannel, options SenderOptions) (Manifest, error) {
@@ -35,6 +37,9 @@ func StreamReader(ctx context.Context, transferID string, source io.Reader, chan
 	}
 	if source == nil || channel == nil {
 		return Manifest{}, fmt.Errorf("%w: missing transfer endpoint", ErrTransferFailed)
+	}
+	if options.Encryption == nil && !options.AllowPlaintext {
+		return Manifest{}, ErrEncryptionRequired
 	}
 	chunkSize := options.ChunkSize
 	if chunkSize <= 0 {
@@ -51,19 +56,9 @@ func StreamReader(ctx context.Context, transferID string, source io.Reader, chan
 		}
 		n, readErr := source.Read(buffer)
 		if n > 0 {
-			chunk := append([]byte(nil), buffer[:n]...)
-			frame := Frame{Version: ProtocolVersion, Type: FrameTypeChunk, TransferID: transferID, Sequence: sequence, Offset: total, Data: chunk}
-			encoded, err := EncodeFrame(frame)
-			if err != nil {
+			if err := sendChunk(ctx, transferID, channel, options, hash, sequence, total, buffer[:n]); err != nil {
 				return Manifest{}, err
 			}
-			if err := waitForBackpressure(ctx, channel, options.MaxBufferedAmount); err != nil {
-				return Manifest{}, fmt.Errorf("%w: %v", ErrTransferFailed, err)
-			}
-			if err := channel.Send(encoded); err != nil {
-				return Manifest{}, fmt.Errorf("%w: %v", ErrTransferFailed, err)
-			}
-			_, _ = hash.Write(chunk)
 			total += int64(n)
 			sequence++
 			if options.OnProgress != nil {
@@ -78,6 +73,16 @@ func StreamReader(ctx context.Context, transferID string, source io.Reader, chan
 		}
 	}
 
+	if total == 0 && sequence == 0 && options.Encryption != nil {
+		if err := sendChunk(ctx, transferID, channel, options, hash, sequence, total, nil); err != nil {
+			return Manifest{}, err
+		}
+		sequence++
+		if options.OnProgress != nil {
+			options.OnProgress(Progress{TransferID: transferID, BytesTransferred: total, TotalBytes: total, ChunksTransferred: sequence})
+		}
+	}
+
 	manifest := Manifest{TransferID: transferID, TotalBytes: total, ChunkCount: sequence, SHA256Hex: hex.EncodeToString(hash.Sum(nil))}
 	encoded, err := EncodeManifestFrame(manifest)
 	if err != nil {
@@ -87,6 +92,32 @@ func StreamReader(ctx context.Context, transferID string, source io.Reader, chan
 		return Manifest{}, fmt.Errorf("%w: %v", ErrTransferFailed, err)
 	}
 	return manifest, nil
+}
+
+func sendChunk(ctx context.Context, transferID string, channel OutboundDataChannel, options SenderOptions, digest io.Writer, sequence uint64, offset int64, plaintext []byte) error {
+	chunk := append([]byte(nil), plaintext...)
+	frameData := chunk
+	var encryption *EncryptionMetadata
+	var err error
+	if options.Encryption != nil {
+		frameData, encryption, err = options.Encryption.EncryptChunk(transferID, sequence, offset, chunk)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrTransferFailed, err)
+		}
+	}
+	frame := Frame{Version: ProtocolVersion, Type: FrameTypeChunk, TransferID: transferID, Sequence: sequence, Offset: offset, Data: frameData, Encryption: encryption}
+	encoded, err := EncodeFrame(frame)
+	if err != nil {
+		return err
+	}
+	if err := waitForBackpressure(ctx, channel, options.MaxBufferedAmount); err != nil {
+		return fmt.Errorf("%w: %v", ErrTransferFailed, err)
+	}
+	if err := channel.Send(encoded); err != nil {
+		return fmt.Errorf("%w: %v", ErrTransferFailed, err)
+	}
+	_, _ = digest.Write(chunk)
+	return nil
 }
 
 func waitForBackpressure(ctx context.Context, channel OutboundDataChannel, maxBuffered uint64) error {

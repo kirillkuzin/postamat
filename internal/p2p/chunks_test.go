@@ -99,6 +99,7 @@ func TestStreamReaderSendsChunksManifestAndProgress(t *testing.T) {
 	manifest, err := StreamReader(ctx, "tr_123", bytes.NewBufferString("hello world"), dc, SenderOptions{
 		ChunkSize:         5,
 		MaxBufferedAmount: 4096,
+		AllowPlaintext:    true,
 		OnProgress: func(p Progress) {
 			progress = append(progress, p)
 		},
@@ -132,7 +133,7 @@ func TestStreamReaderWaitsForBackpressureBeforeSend(t *testing.T) {
 	dc.buffered = 100
 	dc.releaseAfterWait = true
 
-	if _, err := StreamReader(ctx, "tr_123", bytes.NewBufferString("abcdef"), dc, SenderOptions{ChunkSize: 3, MaxBufferedAmount: 10}); err != nil {
+	if _, err := StreamReader(ctx, "tr_123", bytes.NewBufferString("abcdef"), dc, SenderOptions{ChunkSize: 3, MaxBufferedAmount: 10, AllowPlaintext: true}); err != nil {
 		t.Fatalf("stream reader: %v", err)
 	}
 	if dc.waits == 0 {
@@ -147,7 +148,7 @@ func TestStreamReaderBackpressureHonorsContextWhenBufferDoesNotDrain(t *testing.
 	dc.buffered = 100
 	dc.returnWithoutDrain = true
 
-	_, err := StreamReader(ctx, "tr_123", bytes.NewBufferString("abcdef"), dc, SenderOptions{ChunkSize: 3, MaxBufferedAmount: 10})
+	_, err := StreamReader(ctx, "tr_123", bytes.NewBufferString("abcdef"), dc, SenderOptions{ChunkSize: 3, MaxBufferedAmount: 10, AllowPlaintext: true})
 	if !errors.Is(err, ErrTransferFailed) {
 		t.Fatalf("StreamReader error = %v, want ErrTransferFailed", err)
 	}
@@ -160,7 +161,7 @@ func TestStreamReaderSendFailureReturnsTransferFailed(t *testing.T) {
 	dc := newFakeDataChannel()
 	dc.sendErr = io.ErrClosedPipe
 
-	_, err := StreamReader(context.Background(), "tr_123", bytes.NewBufferString("hello"), dc, SenderOptions{ChunkSize: 5})
+	_, err := StreamReader(context.Background(), "tr_123", bytes.NewBufferString("hello"), dc, SenderOptions{ChunkSize: 5, AllowPlaintext: true})
 	if !errors.Is(err, ErrTransferFailed) {
 		t.Fatalf("StreamReader error = %v, want ErrTransferFailed", err)
 	}
@@ -168,13 +169,13 @@ func TestStreamReaderSendFailureReturnsTransferFailed(t *testing.T) {
 
 func TestReceiverAcceptsChunksAndVerifiesManifest(t *testing.T) {
 	dc := newFakeDataChannel()
-	manifest, err := StreamReader(context.Background(), "tr_123", bytes.NewBufferString("hello world"), dc, SenderOptions{ChunkSize: 4})
+	manifest, err := StreamReader(context.Background(), "tr_123", bytes.NewBufferString("hello world"), dc, SenderOptions{ChunkSize: 4, AllowPlaintext: true})
 	if err != nil {
 		t.Fatalf("stream reader: %v", err)
 	}
 
 	var out bytes.Buffer
-	receiver := NewReceiver("tr_123", &out, ReceiverOptions{})
+	receiver := NewReceiver("tr_123", &out, ReceiverOptions{AllowPlaintext: true})
 	var completed *Manifest
 	for _, msg := range dc.sent {
 		completed, err = receiver.Accept(msg)
@@ -192,7 +193,7 @@ func TestReceiverAcceptsChunksAndVerifiesManifest(t *testing.T) {
 
 func TestReceiverRejectsWrongSequenceAndHashMismatch(t *testing.T) {
 	var out bytes.Buffer
-	receiver := NewReceiver("tr_123", &out, ReceiverOptions{})
+	receiver := NewReceiver("tr_123", &out, ReceiverOptions{AllowPlaintext: true})
 
 	badChunk, err := EncodeFrame(Frame{Version: ProtocolVersion, Type: FrameTypeChunk, TransferID: "tr_123", Sequence: 1, Offset: 0, Data: []byte("oops")})
 	if err != nil {
@@ -202,7 +203,7 @@ func TestReceiverRejectsWrongSequenceAndHashMismatch(t *testing.T) {
 		t.Fatalf("unexpected-sequence error = %v", err)
 	}
 
-	receiver = NewReceiver("tr_123", &out, ReceiverOptions{})
+	receiver = NewReceiver("tr_123", &out, ReceiverOptions{AllowPlaintext: true})
 	goodChunk, _ := EncodeFrame(Frame{Version: ProtocolVersion, Type: FrameTypeChunk, TransferID: "tr_123", Sequence: 0, Offset: 0, Data: []byte("hello")})
 	if _, err := receiver.Accept(goodChunk); err != nil {
 		t.Fatalf("accept good chunk: %v", err)
@@ -215,7 +216,7 @@ func TestReceiverRejectsWrongSequenceAndHashMismatch(t *testing.T) {
 
 func TestReceiverFailsClosedAfterProtocolError(t *testing.T) {
 	var out bytes.Buffer
-	receiver := NewReceiver("tr_123", &out, ReceiverOptions{})
+	receiver := NewReceiver("tr_123", &out, ReceiverOptions{AllowPlaintext: true})
 	chunk, _ := EncodeFrame(Frame{Version: ProtocolVersion, Type: FrameTypeChunk, TransferID: "tr_123", Sequence: 0, Offset: 0, Data: []byte("hello")})
 	if _, err := receiver.Accept(chunk); err != nil {
 		t.Fatalf("accept good chunk: %v", err)
