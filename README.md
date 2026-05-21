@@ -101,6 +101,18 @@ go build ./cmd/agentd
 go build ./cmd/postamat
 ```
 
+## Deployment preview
+
+The repository includes an early self-hosting stack under `deployments/`:
+
+```bash
+cp deployments/.env.example deployments/.env
+# edit every change-me value before exposing the stack
+docker compose --env-file deployments/.env -f deployments/compose.yaml up --build
+```
+
+The stack builds recipient frontend assets, packages the Go server/agentd/CLI binaries, and runs `postamat-server` behind Caddy with PostgreSQL and coturn services ready for the production persistence/WebRTC relay path. Runtime health endpoints are available at `/healthz` and `/metrics`.
+
 ## Contributing
 
 postamat is an open-source project and welcomes issues, design discussion, documentation improvements, tests, and pull requests.

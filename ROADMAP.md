@@ -12,6 +12,7 @@ This roadmap describes public project gaps and directions. It is not a release p
 - Application-level E2E chunk encryption and manifest validation.
 - PostgreSQL-compatible repositories and migrations for metadata/audit state.
 - CI that builds frontend assets before Go tests, race tests, vet, coverage, and command builds.
+- Deployment preview with Dockerfile, Compose, Caddy, coturn, `/healthz`, and `/metrics`.
 
 ## Open work
 
@@ -25,10 +26,8 @@ This roadmap describes public project gaps and directions. It is not a release p
 
 ### Deployment and operations
 
-- Docker Compose recipe for server, PostgreSQL, reverse proxy, and TURN/STUN.
-- Example production configuration with TLS, secrets, CORS/origin policy, log redaction, and retention.
 - Database migration runner and backup/restore notes.
-- Metrics, structured logs, health checks, readiness checks, and operational runbooks.
+- Expanded metrics, structured logs, readiness checks, and operational runbooks.
 - Release artifacts for Linux packages/containers and signed checksums.
 
 ### Security and privacy
