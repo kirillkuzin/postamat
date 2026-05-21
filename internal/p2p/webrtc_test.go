@@ -18,8 +18,9 @@ func TestLocalWebRTCPairTransfersSmallFile(t *testing.T) {
 	}
 	defer closePair()
 
+	key := mustTestTransferKey(t)
 	var received bytes.Buffer
-	receiver := NewReceiver("tr_local", &received, ReceiverOptions{})
+	receiver := NewReceiver("tr_local", &received, ReceiverOptions{Encryption: mustTestChunkCipher(t, key)})
 	done := make(chan error, 1)
 	go func() {
 		for msg := range incoming {
@@ -36,7 +37,7 @@ func TestLocalWebRTCPairTransfersSmallFile(t *testing.T) {
 		done <- ErrTransferFailed
 	}()
 
-	manifest, err := StreamReader(ctx, "tr_local", bytes.NewBufferString("web rtc payload"), sender, SenderOptions{ChunkSize: 4, MaxBufferedAmount: 64})
+	manifest, err := StreamReader(ctx, "tr_local", bytes.NewBufferString("web rtc payload"), sender, SenderOptions{ChunkSize: 4, MaxBufferedAmount: 64, Encryption: mustTestChunkCipher(t, key)})
 	if err != nil {
 		t.Fatalf("stream over local webrtc: %v", err)
 	}
@@ -67,7 +68,7 @@ func TestLocalWebRTCPairFailureDoesNotHang(t *testing.T) {
 	}
 	closePair()
 
-	_, err = StreamReader(ctx, "tr_local", bytes.NewBuffer(make([]byte, 128)), sender, SenderOptions{ChunkSize: 64, MaxBufferedAmount: 64})
+	_, err = StreamReader(ctx, "tr_local", bytes.NewBuffer(make([]byte, 128)), sender, SenderOptions{ChunkSize: 64, MaxBufferedAmount: 64, Encryption: mustTestChunkCipher(t, mustTestTransferKey(t))})
 	if !errors.Is(err, ErrTransferFailed) {
 		t.Fatalf("stream after local peer failure error = %v, want ErrTransferFailed", err)
 	}

@@ -8,7 +8,10 @@ import (
 )
 
 type ReceiverOptions struct {
-	OnProgress func(Progress)
+	OnProgress        func(Progress)
+	Encryption        *ChunkCipher
+	RequireEncryption bool
+	AllowPlaintext    bool
 }
 
 type Receiver struct {
@@ -59,6 +62,10 @@ func (r *Receiver) Accept(encoded []byte) (*Manifest, error) {
 		}
 		return nil, nil
 	case FrameTypeManifest:
+		if !r.options.AllowPlaintext && r.nextSeq == 0 {
+			r.failed = true
+			return nil, ErrEncryptionRequired
+		}
 		manifest, err := r.acceptManifest(frame)
 		if err != nil {
 			r.failed = true
@@ -78,15 +85,25 @@ func (r *Receiver) acceptChunk(frame Frame) error {
 	if frame.Offset != r.offset {
 		return ErrUnexpectedOffset
 	}
-	n, err := r.writer.Write(frame.Data)
+	data := frame.Data
+	if frame.Encryption != nil {
+		plaintext, err := r.options.Encryption.DecryptChunk(frame.TransferID, frame.Sequence, frame.Offset, frame.Encryption, frame.Data)
+		if err != nil {
+			return err
+		}
+		data = plaintext
+	} else if r.options.RequireEncryption || !r.options.AllowPlaintext {
+		return ErrEncryptionRequired
+	}
+	n, err := r.writer.Write(data)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrTransferFailed, err)
 	}
-	if n != len(frame.Data) {
+	if n != len(data) {
 		return fmt.Errorf("%w: %w", ErrTransferFailed, io.ErrShortWrite)
 	}
-	_, _ = r.hash.Write(frame.Data)
-	r.offset += int64(len(frame.Data))
+	_, _ = r.hash.Write(data)
+	r.offset += int64(len(data))
 	r.nextSeq++
 	if r.options.OnProgress != nil {
 		r.options.OnProgress(Progress{TransferID: r.transferID, BytesTransferred: r.offset, TotalBytes: r.offset, ChunksTransferred: r.nextSeq})

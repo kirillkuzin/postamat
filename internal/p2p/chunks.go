@@ -35,15 +35,16 @@ var (
 )
 
 type Frame struct {
-	Version    int       `json:"v"`
-	Type       FrameType `json:"type"`
-	TransferID string    `json:"transfer_id"`
-	Sequence   uint64    `json:"seq,omitempty"`
-	Offset     int64     `json:"offset,omitempty"`
-	Data       []byte    `json:"data,omitempty"`
-	TotalBytes int64     `json:"total_bytes,omitempty"`
-	ChunkCount uint64    `json:"chunk_count,omitempty"`
-	SHA256Hex  string    `json:"sha256,omitempty"`
+	Version    int                 `json:"v"`
+	Type       FrameType           `json:"type"`
+	TransferID string              `json:"transfer_id"`
+	Sequence   uint64              `json:"seq,omitempty"`
+	Offset     int64               `json:"offset,omitempty"`
+	Data       []byte              `json:"data,omitempty"`
+	Encryption *EncryptionMetadata `json:"enc,omitempty"`
+	TotalBytes int64               `json:"total_bytes,omitempty"`
+	ChunkCount uint64              `json:"chunk_count,omitempty"`
+	SHA256Hex  string              `json:"sha256,omitempty"`
 }
 
 type Manifest struct {
@@ -106,6 +107,11 @@ func validateFrame(frame Frame) error {
 		}
 		if len(frame.Data) == 0 {
 			return ErrChunkDataRequired
+		}
+		if frame.Encryption != nil {
+			if err := validateEncryptionMetadata(frame.Encryption); err != nil {
+				return err
+			}
 		}
 	case FrameTypeManifest:
 		if frame.TotalBytes < 0 {
