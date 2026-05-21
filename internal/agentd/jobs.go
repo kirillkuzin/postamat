@@ -40,6 +40,7 @@ var (
 	ErrInvalidJobStatus      = errors.New("invalid job status transition")
 	ErrSourcePathRequired    = errors.New("source path is required")
 	ErrTargetAgentRequired   = errors.New("target agent id is required")
+	ErrBrowserTargetConflict = errors.New("browser-link transfer must not include target agent id")
 	ErrFromAgentRequired     = errors.New("from agent id is required")
 	ErrFileNameRequired      = errors.New("file name is required")
 	ErrFileSizeNegative      = errors.New("file size must be non-negative")
@@ -59,6 +60,7 @@ type Job struct {
 	DestinationPath string       `json:"destination_path,omitempty"`
 	FromAgentID     string       `json:"from_agent_id,omitempty"`
 	ToAgentID       string       `json:"to_agent_id,omitempty"`
+	BrowserLink     bool         `json:"browser_link,omitempty"`
 	FileName        string       `json:"file_name"`
 	FileSizeBytes   int64        `json:"file_size_bytes"`
 	ProgressBytes   int64        `json:"progress_bytes"`
@@ -85,6 +87,7 @@ type JobEvent struct {
 type CreateSendJobInput struct {
 	SourcePath    string
 	ToAgentID     string
+	BrowserLink   bool
 	FileName      string
 	FileSizeBytes int64
 }
@@ -116,7 +119,10 @@ func (m *JobManager) CreateSendJob(input CreateSendJobInput) (Job, error) {
 	if input.SourcePath == "" {
 		return Job{}, ErrSourcePathRequired
 	}
-	if input.ToAgentID == "" {
+	if input.BrowserLink && input.ToAgentID != "" {
+		return Job{}, ErrBrowserTargetConflict
+	}
+	if !input.BrowserLink && input.ToAgentID == "" {
 		return Job{}, ErrTargetAgentRequired
 	}
 	if input.FileName == "" {
@@ -129,7 +135,7 @@ func (m *JobManager) CreateSendJob(input CreateSendJobInput) (Job, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := m.now()
-	job := Job{ID: newJobID(), Direction: JobDirectionSend, Status: JobStatusQueued, SourcePath: input.SourcePath, ToAgentID: input.ToAgentID, FileName: input.FileName, FileSizeBytes: input.FileSizeBytes, CreatedAt: now, UpdatedAt: now, sequence: m.nextSequence()}
+	job := Job{ID: newJobID(), Direction: JobDirectionSend, Status: JobStatusQueued, SourcePath: input.SourcePath, ToAgentID: input.ToAgentID, BrowserLink: input.BrowserLink, FileName: input.FileName, FileSizeBytes: input.FileSizeBytes, CreatedAt: now, UpdatedAt: now, sequence: m.nextSequence()}
 	m.jobs[job.ID] = cloneJob(job)
 	m.appendEventLocked(job, JobEvent{Type: JobEventCreated, Status: job.Status})
 	return cloneJob(job), nil

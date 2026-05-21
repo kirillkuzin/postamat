@@ -50,6 +50,79 @@ func TestLocalAPITransferLifecycle(t *testing.T) {
 	}
 }
 
+func TestLocalAPIResolvesTransferIDForStatusCancelAndEvents(t *testing.T) {
+	manager := NewJobManager(func() time.Time { return time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC) })
+	job, err := manager.CreateSendJob(CreateSendJobInput{SourcePath: "/tmp/report.pdf", ToAgentID: "agent-b", FileName: "report.pdf", FileSizeBytes: 42})
+	if err != nil {
+		t.Fatalf("CreateSendJob returned error: %v", err)
+	}
+	if _, err := manager.AttachTransfer(job.ID, "tr_backend", "ticket"); err != nil {
+		t.Fatalf("AttachTransfer returned error: %v", err)
+	}
+	handler := NewLocalRouter(manager)
+
+	getReq := httptest.NewRequest(http.MethodGet, "/local/v1/transfers/tr_backend", nil)
+	getRec := httptest.NewRecorder()
+	handler.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("get by transfer id status = %d, body = %s", getRec.Code, getRec.Body.String())
+	}
+	var status jobResponse
+	if err := json.NewDecoder(getRec.Body).Decode(&status); err != nil {
+		t.Fatalf("decode get by transfer id: %v", err)
+	}
+	if status.ID != job.ID || status.TransferID != "tr_backend" {
+		t.Fatalf("unexpected transfer-id status response: %+v", status)
+	}
+
+	eventsReq := httptest.NewRequest(http.MethodGet, "/local/v1/transfers/tr_backend/events", nil)
+	eventsRec := httptest.NewRecorder()
+	handler.ServeHTTP(eventsRec, eventsReq)
+	if eventsRec.Code != http.StatusOK {
+		t.Fatalf("events by transfer id status = %d, body = %s", eventsRec.Code, eventsRec.Body.String())
+	}
+
+	cancelReq := httptest.NewRequest(http.MethodPost, "/local/v1/transfers/tr_backend/cancel", nil)
+	cancelRec := httptest.NewRecorder()
+	handler.ServeHTTP(cancelRec, cancelReq)
+	if cancelRec.Code != http.StatusOK {
+		t.Fatalf("cancel by transfer id status = %d, body = %s", cancelRec.Code, cancelRec.Body.String())
+	}
+	var cancelled jobResponse
+	if err := json.NewDecoder(cancelRec.Body).Decode(&cancelled); err != nil {
+		t.Fatalf("decode cancel response: %v", err)
+	}
+	if cancelled.Status != string(JobStatusCancelled) {
+		t.Fatalf("cancelled status = %q", cancelled.Status)
+	}
+}
+
+func TestLocalAPIEscapedTransferIDsDoNotChangeRouteShape(t *testing.T) {
+	manager := NewJobManager(nil)
+	job, err := manager.CreateSendJob(CreateSendJobInput{SourcePath: "/tmp/report.pdf", ToAgentID: "agent-b", FileName: "report.pdf", FileSizeBytes: 42})
+	if err != nil {
+		t.Fatalf("CreateSendJob returned error: %v", err)
+	}
+	if _, err := manager.AttachTransfer(job.ID, "tr/with/slash", "ticket"); err != nil {
+		t.Fatalf("AttachTransfer returned error: %v", err)
+	}
+	handler := NewLocalRouter(manager)
+
+	getReq := httptest.NewRequest(http.MethodGet, "/local/v1/transfers/tr%2Fwith%2Fslash", nil)
+	getRec := httptest.NewRecorder()
+	handler.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("escaped transfer id status = %d, body = %s", getRec.Code, getRec.Body.String())
+	}
+
+	injectedReq := httptest.NewRequest(http.MethodGet, "/local/v1/transfers/"+job.ID+"%2Fevents", nil)
+	injectedRec := httptest.NewRecorder()
+	handler.ServeHTTP(injectedRec, injectedReq)
+	if injectedRec.Code != http.StatusNotFound {
+		t.Fatalf("escaped slash should remain inside id and not route to events endpoint; status = %d, body = %s", injectedRec.Code, injectedRec.Body.String())
+	}
+}
+
 func TestLocalAPIEventsAndInbox(t *testing.T) {
 	manager := NewJobManager(func() time.Time { return time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC) })
 	receive, err := manager.CreateReceiveJob(CreateReceiveJobInput{TransferID: "tr_in", FromAgentID: "agent-a", FileName: "payload.bin", FileSizeBytes: 12})

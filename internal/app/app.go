@@ -4,20 +4,27 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"time"
 
+	"github.com/kirillkuzin/postamat/internal/agentd"
 	"github.com/kirillkuzin/postamat/internal/api"
 	"github.com/kirillkuzin/postamat/internal/sessions"
 )
 
 type Options struct {
-	Name          string
-	ListenAddress string
-	TokenPepper   string
-	Ready         chan<- string
+	Name            string
+	Args            []string
+	ListenAddress   string
+	LocalSocketPath string
+	TokenPepper     string
+	Stdin           io.Reader
+	Stdout          io.Writer
+	Stderr          io.Writer
+	Ready           chan<- string
 }
 
 func Run(ctx context.Context, opts Options) error {
@@ -30,8 +37,10 @@ func Run(ctx context.Context, opts Options) error {
 	switch opts.Name {
 	case "server":
 		return runServer(ctx, opts)
-	case "agentd", "cli":
-		return nil
+	case "agentd":
+		return runAgentd(ctx, opts)
+	case "cli":
+		return runCLI(ctx, opts)
 	case "":
 		return errors.New("command name is required")
 	default:
@@ -88,6 +97,34 @@ func runServer(ctx context.Context, opts Options) error {
 		return nil
 	}
 	return err
+}
+
+func runAgentd(ctx context.Context, opts Options) error {
+	socketPath := localSocketPath(opts)
+	server, err := agentd.ListenUnix(ctx, socketPath, agentd.NewLocalRouter(agentd.NewJobManager(nil)))
+	if err != nil {
+		return err
+	}
+	defer server.Close()
+	if opts.Ready != nil {
+		select {
+		case opts.Ready <- socketPath:
+		case <-ctx.Done():
+			return nil
+		}
+	}
+	<-ctx.Done()
+	return nil
+}
+
+func localSocketPath(opts Options) string {
+	if opts.LocalSocketPath != "" {
+		return opts.LocalSocketPath
+	}
+	if value := os.Getenv("POSTAMAT_AGENTD_SOCKET"); value != "" {
+		return value
+	}
+	return "/tmp/postamat/agentd.sock"
 }
 
 func envOrDefault(key string, fallback string) string {

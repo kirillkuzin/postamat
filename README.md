@@ -14,6 +14,7 @@ The project is designed for self-hosting and for automation-first clients: local
 The repository currently contains the foundations for:
 
 - agent-to-agent secure transfers through local `postamat agentd` daemons;
+- CLI and MCP adapter commands for creating, listing, inspecting, and cancelling local agentd jobs;
 - browser `/p/{token}` recipient flow and signaling path;
 - application-level end-to-end encryption for transferred chunks;
 - backend-visible coordination metadata: transfer intent, lifecycle state, routing, policy, transient signaling, and audit events;
@@ -54,7 +55,7 @@ internal/
   agentd/         local daemon API, job state, backend client, inbox, Unix socket server
   agents/         agent identity, device registration, capabilities
   api/            REST routes, public recipient routes, WebSocket handlers
-  app/            command wiring
+  app/            command wiring, CLI, and MCP adapter over local agentd
   audit/          audit event model and redaction
   auth/           bearer tokens, transfer tickets, scoped identities
   build/          build/CI invariants
@@ -100,6 +101,27 @@ go build ./cmd/server
 go build ./cmd/agentd
 go build ./cmd/postamat
 ```
+
+## CLI and MCP adapter
+
+Start a local daemon socket:
+
+```bash
+postamat agentd
+```
+
+Use the CLI against that socket (`POSTAMAT_AGENTD_SOCKET` or `/tmp/postamat/agentd.sock` by default):
+
+```bash
+postamat send ./file.bin --to-agent agent-b
+postamat share ./file.bin --browser-link
+postamat status <transfer_or_job_id>
+postamat cancel <transfer_or_job_id>
+postamat list
+postamat inbox
+```
+
+Automation clients can run `postamat mcp` and call the local MCP-style tools `create`, `status`, `cancel`, `list`, and `list_inbox`; the adapter stays a control-plane shim over `agentd` rather than moving file bytes through MCP.
 
 ## Deployment preview
 

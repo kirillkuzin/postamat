@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -14,6 +15,7 @@ type LocalRouter struct {
 type createLocalTransferRequest struct {
 	SourcePath    string `json:"source_path"`
 	ToAgentID     string `json:"to_agent_id"`
+	BrowserLink   bool   `json:"browser_link"`
 	FileName      string `json:"file_name"`
 	FileSizeBytes int64  `json:"file_size_bytes"`
 }
@@ -27,6 +29,7 @@ type jobResponse struct {
 	DestinationPath string `json:"destination_path,omitempty"`
 	FromAgentID     string `json:"from_agent_id,omitempty"`
 	ToAgentID       string `json:"to_agent_id,omitempty"`
+	BrowserLink     bool   `json:"browser_link,omitempty"`
 	FileName        string `json:"file_name"`
 	FileSizeBytes   int64  `json:"file_size_bytes"`
 	ProgressBytes   int64  `json:"progress_bytes"`
@@ -41,12 +44,13 @@ func NewLocalRouter(jobs *JobManager) http.Handler {
 }
 
 func (r *LocalRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	path := req.URL.EscapedPath()
 	switch {
-	case req.URL.Path == "/local/v1/transfers":
+	case path == "/local/v1/transfers":
 		r.handleTransfers(w, req)
-	case strings.HasPrefix(req.URL.Path, "/local/v1/transfers/"):
+	case strings.HasPrefix(path, "/local/v1/transfers/"):
 		r.handleTransfer(w, req)
-	case req.URL.Path == "/local/v1/inbox":
+	case path == "/local/v1/inbox":
 		r.handleInbox(w, req)
 	default:
 		http.NotFound(w, req)
@@ -63,7 +67,7 @@ func (r *LocalRouter) handleTransfers(w http.ResponseWriter, req *http.Request) 
 			writeLocalError(w, http.StatusBadRequest, "invalid JSON")
 			return
 		}
-		job, err := r.jobs.CreateSendJob(CreateSendJobInput{SourcePath: payload.SourcePath, ToAgentID: payload.ToAgentID, FileName: payload.FileName, FileSizeBytes: payload.FileSizeBytes})
+		job, err := r.jobs.CreateSendJob(CreateSendJobInput{SourcePath: payload.SourcePath, ToAgentID: payload.ToAgentID, BrowserLink: payload.BrowserLink, FileName: payload.FileName, FileSizeBytes: payload.FileSizeBytes})
 		if err != nil {
 			writeLocalError(w, statusForJobError(err), err.Error())
 			return
@@ -84,12 +88,16 @@ func (r *LocalRouter) handleTransfers(w http.ResponseWriter, req *http.Request) 
 }
 
 func (r *LocalRouter) handleTransfer(w http.ResponseWriter, req *http.Request) {
-	parts := strings.Split(strings.TrimPrefix(req.URL.Path, "/local/v1/transfers/"), "/")
+	parts := strings.Split(strings.TrimPrefix(req.URL.EscapedPath(), "/local/v1/transfers/"), "/")
 	if len(parts) == 0 || parts[0] == "" || len(parts) > 2 {
 		http.NotFound(w, req)
 		return
 	}
-	jobID := parts[0]
+	jobID, err := url.PathUnescape(parts[0])
+	if err != nil || jobID == "" {
+		http.NotFound(w, req)
+		return
+	}
 	if len(parts) == 2 {
 		switch parts[1] {
 		case "cancel":
@@ -106,7 +114,7 @@ func (r *LocalRouter) handleTransfer(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	job, err := r.jobs.Get(jobID)
+	job, err := r.jobByIDOrTransferID(jobID)
 	if err != nil {
 		writeLocalError(w, statusForJobError(err), err.Error())
 		return
@@ -119,7 +127,12 @@ func (r *LocalRouter) handleCancelTransfer(w http.ResponseWriter, req *http.Requ
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	job, err := r.jobs.Cancel(jobID)
+	job, err := r.jobByIDOrTransferID(jobID)
+	if err != nil {
+		writeLocalError(w, statusForJobError(err), err.Error())
+		return
+	}
+	job, err = r.jobs.Cancel(job.ID)
 	if err != nil {
 		writeLocalError(w, statusForJobError(err), err.Error())
 		return
@@ -132,7 +145,12 @@ func (r *LocalRouter) handleTransferEvents(w http.ResponseWriter, req *http.Requ
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	events, err := r.jobs.Events(jobID)
+	job, err := r.jobByIDOrTransferID(jobID)
+	if err != nil {
+		writeLocalError(w, statusForJobError(err), err.Error())
+		return
+	}
+	events, err := r.jobs.Events(job.ID)
 	if err != nil {
 		writeLocalError(w, statusForJobError(err), err.Error())
 		return
@@ -157,15 +175,30 @@ func (r *LocalRouter) handleInbox(w http.ResponseWriter, req *http.Request) {
 	writeLocalJSON(w, http.StatusOK, response)
 }
 
+func (r *LocalRouter) jobByIDOrTransferID(id string) (Job, error) {
+	job, err := r.jobs.Get(id)
+	if err == nil {
+		return job, nil
+	}
+	if !errors.Is(err, ErrJobNotFound) {
+		return Job{}, err
+	}
+	found, ok := r.jobs.FindByTransferID(id)
+	if !ok {
+		return Job{}, ErrJobNotFound
+	}
+	return found, nil
+}
+
 func newJobResponse(job Job) jobResponse {
-	return jobResponse{ID: job.ID, Direction: string(job.Direction), Status: string(job.Status), TransferID: job.TransferID, SourcePath: job.SourcePath, DestinationPath: job.DestinationPath, FromAgentID: job.FromAgentID, ToAgentID: job.ToAgentID, FileName: job.FileName, FileSizeBytes: job.FileSizeBytes, ProgressBytes: job.ProgressBytes, FailureReason: job.FailureReason}
+	return jobResponse{ID: job.ID, Direction: string(job.Direction), Status: string(job.Status), TransferID: job.TransferID, SourcePath: job.SourcePath, DestinationPath: job.DestinationPath, FromAgentID: job.FromAgentID, ToAgentID: job.ToAgentID, BrowserLink: job.BrowserLink, FileName: job.FileName, FileSizeBytes: job.FileSizeBytes, ProgressBytes: job.ProgressBytes, FailureReason: job.FailureReason}
 }
 
 func statusForJobError(err error) int {
 	switch {
 	case errors.Is(err, ErrJobNotFound):
 		return http.StatusNotFound
-	case errors.Is(err, ErrSourcePathRequired), errors.Is(err, ErrTargetAgentRequired), errors.Is(err, ErrFromAgentRequired), errors.Is(err, ErrFileNameRequired), errors.Is(err, ErrFileSizeNegative), errors.Is(err, ErrTransferIDRequired), errors.Is(err, ErrDuplicateTransferID), errors.Is(err, ErrProgressOutOfRange), errors.Is(err, ErrJobTerminal), errors.Is(err, ErrInvalidJobStatus), errors.Is(err, ErrFailureReasonRequired):
+	case errors.Is(err, ErrSourcePathRequired), errors.Is(err, ErrTargetAgentRequired), errors.Is(err, ErrBrowserTargetConflict), errors.Is(err, ErrFromAgentRequired), errors.Is(err, ErrFileNameRequired), errors.Is(err, ErrFileSizeNegative), errors.Is(err, ErrTransferIDRequired), errors.Is(err, ErrDuplicateTransferID), errors.Is(err, ErrProgressOutOfRange), errors.Is(err, ErrJobTerminal), errors.Is(err, ErrInvalidJobStatus), errors.Is(err, ErrFailureReasonRequired):
 		return http.StatusBadRequest
 	default:
 		return http.StatusInternalServerError

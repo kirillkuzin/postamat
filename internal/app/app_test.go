@@ -11,13 +11,13 @@ import (
 	"github.com/kirillkuzin/postamat/internal/app"
 )
 
-func TestRunAcceptsNonServerSkeletonCommands(t *testing.T) {
-	for _, name := range []string{"agentd", "cli"} {
-		t.Run(name, func(t *testing.T) {
-			if err := app.Run(context.Background(), app.Options{Name: name}); err != nil {
-				t.Fatalf("Run(%q) returned error: %v", name, err)
-			}
-		})
+func TestRunCLIHelpReturnsUsage(t *testing.T) {
+	var stdout strings.Builder
+	if err := app.Run(context.Background(), app.Options{Name: "cli", Args: []string{"help"}, Stdout: &stdout}); err != nil {
+		t.Fatalf("Run(cli help) returned error: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "postamat send") || !strings.Contains(stdout.String(), "mcp") {
+		t.Fatalf("help output missing CLI commands:\n%s", stdout.String())
 	}
 }
 
