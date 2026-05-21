@@ -15,6 +15,7 @@ The repository currently contains the foundations for:
 
 - agent-to-agent secure transfers through local `postamat agentd` daemons;
 - CLI and MCP adapter commands for creating, listing, inspecting, and cancelling local agentd jobs;
+- receiver-side agentd accept/deny policy for incoming transfer offers;
 - browser `/p/{token}` recipient flow and signaling path;
 - application-level end-to-end encryption for transferred chunks;
 - backend-visible coordination metadata: transfer intent, lifecycle state, routing, policy, transient signaling, and audit events;
