@@ -171,6 +171,58 @@ func (l *BackendLoop) CreateSendTransfer(ctx context.Context, input CreateSendJo
 	return l.jobs.MarkOffered(job.ID)
 }
 
+func (l *BackendLoop) RunTransfer(ctx context.Context, job Job) error {
+	if job.TransferID == "" || job.AgentTicket == "" {
+		return ErrTransferIDRequired
+	}
+	conn, err := l.ConnectTransfer(ctx, job.TransferID, job.AgentTicket)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+	defer close(done)
+	conn.SetReadLimit(1 << 20)
+	if job.Direction == JobDirectionSend {
+		if err := l.sendTransferOffer(conn, job); err != nil {
+			return err
+		}
+	}
+	for {
+		var envelope signaling.Envelope
+		if err := conn.ReadJSON(&envelope); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		if envelope.TransferID != "" && envelope.TransferID != job.TransferID {
+			return ErrOfferRecipientMismatch
+		}
+		if err := l.HandleEnvelope(ctx, envelope); err != nil {
+			return err
+		}
+	}
+}
+
+func (l *BackendLoop) sendTransferOffer(conn *websocket.Conn, job Job) error {
+	payload, err := json.Marshal(map[string]any{
+		"file_name":       job.FileName,
+		"file_size_bytes": job.FileSizeBytes,
+	})
+	if err != nil {
+		return err
+	}
+	return conn.WriteJSON(signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: job.TransferID, FromAgentID: l.agentID, ToAgentID: job.ToAgentID, Payload: payload})
+}
+
 func (l *BackendLoop) ConnectTransfer(ctx context.Context, transferID string, ticket string) (*websocket.Conn, error) {
 	if l.client == nil {
 		return nil, ErrBackendClientRequired

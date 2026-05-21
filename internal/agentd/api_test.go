@@ -7,6 +7,9 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/kirillkuzin/postamat/internal/signaling"
 )
 
 func TestLocalAPITransferLifecycle(t *testing.T) {
@@ -47,6 +50,81 @@ func TestLocalAPITransferLifecycle(t *testing.T) {
 	}
 	if cancelled.Status != string(JobStatusCancelled) {
 		t.Fatalf("cancelled status = %q, want %q", cancelled.Status, JobStatusCancelled)
+	}
+}
+
+func TestLocalAPICreateDelegatesToBackendLoopWhenConfigured(t *testing.T) {
+	var backendPayload map[string]any
+	messages := make(chan signaling.Envelope, 2)
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/api/v1/transfers":
+			if req.Method != http.MethodPost {
+				t.Fatalf("unexpected backend method %s for %s", req.Method, req.URL.Path)
+			}
+			if err := json.NewDecoder(req.Body).Decode(&backendPayload); err != nil {
+				t.Fatalf("decode backend request: %v", err)
+			}
+			writeJSONForTest(w, http.StatusCreated, map[string]any{"transfer_id": "tr_backend", "agent_ticket": "ticket_backend"})
+		case "/api/v1/agent/ws":
+			conn, err := upgrader.Upgrade(w, req, nil)
+			if err != nil {
+				t.Fatalf("upgrade backend ws: %v", err)
+			}
+			defer conn.Close()
+			for i := 0; i < 2; i++ {
+				var envelope signaling.Envelope
+				if err := conn.ReadJSON(&envelope); err != nil {
+					t.Fatalf("read backend signaling message %d: %v", i, err)
+				}
+				messages <- envelope
+			}
+		default:
+			t.Fatalf("unexpected backend request %s %s", req.Method, req.URL.Path)
+		}
+	}))
+	defer backend.Close()
+
+	manager := NewJobManager(func() time.Time { return time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC) })
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-a", DeviceID: "dev-1", Jobs: manager, Client: NewBackendClient(backend.URL, backend.Client())})
+	handler := NewLocalRouterWithBackend(manager, loop)
+	createBody := []byte(`{"source_path":"/tmp/report.pdf","to_agent_id":"agent-b","file_name":"report.pdf","file_size_bytes":42}`)
+
+	createRec := httptest.NewRecorder()
+	handler.ServeHTTP(createRec, httptest.NewRequest(http.MethodPost, "/local/v1/transfers", bytes.NewReader(createBody)))
+
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, body = %s", createRec.Code, createRec.Body.String())
+	}
+	var created jobResponse
+	if err := json.NewDecoder(createRec.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	if created.TransferID != "tr_backend" || created.Status != string(JobStatusOffered) {
+		t.Fatalf("backend transfer not attached/offered: %+v", created)
+	}
+	if backendPayload["from_agent_id"] != "agent-a" || backendPayload["to_agent_id"] != "agent-b" || backendPayload["file_name"] != "report.pdf" || backendPayload["file_size_bytes"] != float64(42) {
+		t.Fatalf("unexpected backend payload: %+v", backendPayload)
+	}
+	gotHello := readSignalingMessage(t, messages, "hello")
+	if gotHello.Type != signaling.MessageAgentHello || gotHello.AgentID != "agent-a" || gotHello.DeviceID != "dev-1" || gotHello.TransferID != "tr_backend" {
+		t.Fatalf("unexpected backend hello: %+v", gotHello)
+	}
+	gotOffer := readSignalingMessage(t, messages, "offer")
+	if gotOffer.Type != signaling.MessageTransferOffer || gotOffer.TransferID != "tr_backend" || gotOffer.FromAgentID != "agent-a" || gotOffer.ToAgentID != "agent-b" {
+		t.Fatalf("unexpected backend offer: %+v", gotOffer)
+	}
+}
+
+func readSignalingMessage(t *testing.T, messages <-chan signaling.Envelope, label string) signaling.Envelope {
+	t.Helper()
+	select {
+	case got := <-messages:
+		return got
+	case <-time.After(2 * time.Second):
+		t.Fatalf("backend signaling loop did not receive %s", label)
+		return signaling.Envelope{}
 	}
 }
 

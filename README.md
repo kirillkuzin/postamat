@@ -110,6 +110,15 @@ Start a local daemon socket:
 postamat agentd
 ```
 
+To create backend transfer records for local agent-to-agent sends and start the transfer-scoped signaling connection, configure the daemon identity and backend URL:
+
+```bash
+POSTAMAT_BACKEND_URL=https://postamat.example \
+POSTAMAT_AGENT_ID=agent-a \
+POSTAMAT_DEVICE_ID=laptop-1 \
+postamat agentd
+```
+
 Use the CLI against that socket (`POSTAMAT_AGENTD_SOCKET` or `/tmp/postamat/agentd.sock` by default):
 
 ```bash

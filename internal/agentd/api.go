@@ -1,6 +1,7 @@
 package agentd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -9,7 +10,9 @@ import (
 )
 
 type LocalRouter struct {
-	jobs *JobManager
+	ctx     context.Context
+	jobs    *JobManager
+	backend *BackendLoop
 }
 
 type createLocalTransferRequest struct {
@@ -37,10 +40,25 @@ type jobResponse struct {
 }
 
 func NewLocalRouter(jobs *JobManager) http.Handler {
-	if jobs == nil {
-		jobs = NewJobManager(nil)
+	return NewLocalRouterWithBackendContext(context.Background(), jobs, nil)
+}
+
+func NewLocalRouterWithBackend(jobs *JobManager, backend *BackendLoop) http.Handler {
+	return NewLocalRouterWithBackendContext(context.Background(), jobs, backend)
+}
+
+func NewLocalRouterWithBackendContext(ctx context.Context, jobs *JobManager, backend *BackendLoop) http.Handler {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	return &LocalRouter{jobs: jobs}
+	if jobs == nil {
+		if backend != nil && backend.jobs != nil {
+			jobs = backend.jobs
+		} else {
+			jobs = NewJobManager(nil)
+		}
+	}
+	return &LocalRouter{ctx: ctx, jobs: jobs, backend: backend}
 }
 
 func (r *LocalRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -67,7 +85,8 @@ func (r *LocalRouter) handleTransfers(w http.ResponseWriter, req *http.Request) 
 			writeLocalError(w, http.StatusBadRequest, "invalid JSON")
 			return
 		}
-		job, err := r.jobs.CreateSendJob(CreateSendJobInput{SourcePath: payload.SourcePath, ToAgentID: payload.ToAgentID, BrowserLink: payload.BrowserLink, FileName: payload.FileName, FileSizeBytes: payload.FileSizeBytes})
+		input := CreateSendJobInput{SourcePath: payload.SourcePath, ToAgentID: payload.ToAgentID, BrowserLink: payload.BrowserLink, FileName: payload.FileName, FileSizeBytes: payload.FileSizeBytes}
+		job, err := r.createSendJob(req, input)
 		if err != nil {
 			writeLocalError(w, statusForJobError(err), err.Error())
 			return
@@ -85,6 +104,22 @@ func (r *LocalRouter) handleTransfers(w http.ResponseWriter, req *http.Request) 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func (r *LocalRouter) createSendJob(req *http.Request, input CreateSendJobInput) (Job, error) {
+	if r.backend != nil && !input.BrowserLink {
+		job, err := r.backend.CreateSendTransfer(req.Context(), input)
+		if err != nil {
+			return Job{}, err
+		}
+		go func() {
+			if err := r.backend.RunTransfer(r.ctx, job); err != nil && r.ctx.Err() == nil {
+				_, _ = r.jobs.Fail(job.ID, err.Error())
+			}
+		}()
+		return job, nil
+	}
+	return r.jobs.CreateSendJob(input)
 }
 
 func (r *LocalRouter) handleTransfer(w http.ResponseWriter, req *http.Request) {

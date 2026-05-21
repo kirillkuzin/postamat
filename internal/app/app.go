@@ -20,6 +20,9 @@ type Options struct {
 	Args            []string
 	ListenAddress   string
 	LocalSocketPath string
+	BackendURL      string
+	AgentID         string
+	DeviceID        string
 	TokenPepper     string
 	Stdin           io.Reader
 	Stdout          io.Writer
@@ -101,7 +104,12 @@ func runServer(ctx context.Context, opts Options) error {
 
 func runAgentd(ctx context.Context, opts Options) error {
 	socketPath := localSocketPath(opts)
-	server, err := agentd.ListenUnix(ctx, socketPath, agentd.NewLocalRouter(agentd.NewJobManager(nil)))
+	jobs := agentd.NewJobManager(nil)
+	handler, err := agentdHandler(ctx, opts, jobs)
+	if err != nil {
+		return err
+	}
+	server, err := agentd.ListenUnix(ctx, socketPath, handler)
 	if err != nil {
 		return err
 	}
@@ -115,6 +123,29 @@ func runAgentd(ctx context.Context, opts Options) error {
 	}
 	<-ctx.Done()
 	return nil
+}
+
+func agentdHandler(ctx context.Context, opts Options, jobs *agentd.JobManager) (http.Handler, error) {
+	backendURL := opts.BackendURL
+	if backendURL == "" {
+		backendURL = os.Getenv("POSTAMAT_BACKEND_URL")
+	}
+	if backendURL == "" {
+		return agentd.NewLocalRouter(jobs), nil
+	}
+	agentID := opts.AgentID
+	if agentID == "" {
+		agentID = os.Getenv("POSTAMAT_AGENT_ID")
+	}
+	if agentID == "" {
+		return nil, errors.New("POSTAMAT_AGENT_ID is required when POSTAMAT_BACKEND_URL is configured")
+	}
+	deviceID := opts.DeviceID
+	if deviceID == "" {
+		deviceID = envOrDefault("POSTAMAT_DEVICE_ID", "agentd-local")
+	}
+	loop := agentd.NewBackendLoop(agentd.BackendLoopOptions{AgentID: agentID, DeviceID: deviceID, Jobs: jobs, Client: agentd.NewBackendClient(backendURL, nil)})
+	return agentd.NewLocalRouterWithBackendContext(ctx, jobs, loop), nil
 }
 
 func localSocketPath(opts Options) string {

@@ -14,6 +14,7 @@ This roadmap describes public project gaps and directions. It is not a release p
 - CI that builds frontend assets before Go tests, race tests, vet, coverage, and command builds.
 - Deployment preview with Dockerfile, Compose, Caddy, coturn, `/healthz`, and `/metrics`.
 - CLI and MCP adapter over local `agentd` for create/status/cancel/list/inbox control-plane operations.
+- Local `postamat agentd` can attach agent-to-agent sends to backend transfer IDs and start a transfer-scoped WSS signaling connection when configured with `POSTAMAT_BACKEND_URL` + agent identity.
 
 ## Open work
 
