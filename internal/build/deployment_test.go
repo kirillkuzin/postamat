@@ -35,13 +35,19 @@ func TestComposeDefinesServerPostgresProxyAndTurn(t *testing.T) {
 	for _, want := range []string{
 		"postamat-server:",
 		"postgres:",
-		"caddy:",
 		"coturn:",
 		"POSTAMAT_HTTP_ADDR=:8080",
 		"POSTAMAT_DATABASE_URL=postgres://",
 		"/healthz",
 		"/metrics",
-		"deployments/caddy/Caddyfile",
+		"traefik-public:",
+		"traefik.enable=true",
+		"traefik.docker.network=traefik-public",
+		"traefik.http.routers.postamat-http.entrypoints=web",
+		"traefik.http.routers.postamat-https.entrypoints=websecure",
+		"traefik.http.routers.postamat-https.tls.certresolver=letsencrypt",
+		"Host(`${POSTAMAT_PUBLIC_HOST:?set POSTAMAT_PUBLIC_HOST}`)",
+		"postamat-postgres:/var/lib/postgresql",
 		"deployments/coturn/turnserver.conf",
 		"--realm=${TURN_REALM:?set TURN_REALM}",
 		"--static-auth-secret=${TURN_STATIC_AUTH_SECRET:?set TURN_STATIC_AUTH_SECRET}",
@@ -50,9 +56,9 @@ func TestComposeDefinesServerPostgresProxyAndTurn(t *testing.T) {
 			t.Fatalf("compose.yaml missing %q", want)
 		}
 	}
-	for _, forbidden := range []string{"POSTGRES_PASSWORD=postamat", "static-auth-secret=postamat"} {
+	for _, forbidden := range []string{"POSTGRES_PASSWORD=postamat", "static-auth-secret=postamat", "caddy:"} {
 		if strings.Contains(compose, forbidden) {
-			t.Fatalf("compose.yaml must not embed default secret %q", forbidden)
+			t.Fatalf("compose.yaml must not embed default secret or proxy %q", forbidden)
 		}
 	}
 }
@@ -60,14 +66,12 @@ func TestComposeDefinesServerPostgresProxyAndTurn(t *testing.T) {
 func TestDeploymentExamplesDocumentRequiredSecrets(t *testing.T) {
 	files := map[string][]string{
 		"../../deployments/.env.example": {
-			"POSTAMAT_PUBLIC_BASE_URL=",
+			"POSTAMAT_PUBLIC_BASE_URL=https://postamat.crazybrain.space",
+			"POSTAMAT_PUBLIC_HOST=postamat.crazybrain.space",
 			"POSTAMAT_TOKEN_PEPPER=change-me",
 			"POSTGRES_PASSWORD=change-me",
+			"TURN_REALM=postamat.crazybrain.space",
 			"TURN_STATIC_AUTH_SECRET=change-me",
-		},
-		"../../deployments/caddy/Caddyfile": {
-			"reverse_proxy postamat-server:8080",
-			"header /metrics Cache-Control no-store",
 		},
 		"../../deployments/coturn/turnserver.conf": {
 			"use-auth-secret",

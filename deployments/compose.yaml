@@ -16,6 +16,24 @@ services:
       - POSTAMAT_METRICS_PATH=/metrics
     expose:
       - "8080"
+    networks:
+      - default
+      - traefik-public
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=traefik-public
+      - traefik.http.middlewares.postamat-https-redirect.redirectscheme.scheme=https
+      - traefik.http.middlewares.postamat-https-redirect.redirectscheme.permanent=true
+      - traefik.http.routers.postamat-http.entrypoints=web
+      - traefik.http.routers.postamat-http.rule=Host(`${POSTAMAT_PUBLIC_HOST:?set POSTAMAT_PUBLIC_HOST}`)
+      - traefik.http.routers.postamat-http.middlewares=postamat-https-redirect
+      - traefik.http.routers.postamat-http.service=postamat
+      - traefik.http.routers.postamat-https.entrypoints=websecure
+      - traefik.http.routers.postamat-https.rule=Host(`${POSTAMAT_PUBLIC_HOST:?set POSTAMAT_PUBLIC_HOST}`)
+      - traefik.http.routers.postamat-https.tls=true
+      - traefik.http.routers.postamat-https.tls.certresolver=letsencrypt
+      - traefik.http.routers.postamat-https.service=postamat
+      - traefik.http.services.postamat.loadbalancer.server.port=8080
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
       interval: 30s
@@ -31,30 +49,12 @@ services:
       - POSTGRES_USER=postamat
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
     volumes:
-      - postamat-postgres:/var/lib/postgresql/data
+      - postamat-postgres:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postamat -d postamat"]
       interval: 10s
       timeout: 5s
       retries: 5
-
-  caddy:
-    image: caddy:2.11-alpine
-    restart: unless-stopped
-    depends_on:
-      postamat-server:
-        condition: service_healthy
-    environment:
-      - POSTAMAT_PUBLIC_HOST=${POSTAMAT_PUBLIC_HOST:?set POSTAMAT_PUBLIC_HOST}
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-      - caddy-config:/config
-    labels:
-      postamat.config: deployments/caddy/Caddyfile
 
   coturn:
     image: coturn/coturn:4.7.0-r0-alpine
@@ -79,5 +79,7 @@ services:
 
 volumes:
   postamat-postgres:
-  caddy-data:
-  caddy-config:
+
+networks:
+  traefik-public:
+    external: true
