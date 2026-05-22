@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/kirillkuzin/postamat/internal/agentd"
@@ -24,6 +25,8 @@ type Options struct {
 	AgentID         string
 	DeviceID        string
 	TokenPepper     string
+	AgentAuthToken  string
+	AgentTokens     map[string]string
 	Stdin           io.Reader
 	Stdout          io.Writer
 	Stderr          io.Writer
@@ -70,8 +73,13 @@ func runServer(ctx context.Context, opts Options) error {
 	}
 
 	service := sessions.NewService(sessions.NewMemoryRepository(), sessions.RandomTokenIssuer{Pepper: pepper}, nil)
+	agentAuth, err := agentAuthenticatorFromOptions(opts, pepper)
+	if err != nil {
+		_ = listener.Close()
+		return err
+	}
 	server := &http.Server{
-		Handler:           api.NewRouter(service),
+		Handler:           api.NewRouterWithSignalingAndAgentAuth(service, nil, nil, agentAuth),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -144,7 +152,11 @@ func agentdHandler(ctx context.Context, opts Options, jobs *agentd.JobManager) (
 	if deviceID == "" {
 		deviceID = envOrDefault("POSTAMAT_DEVICE_ID", "agentd-local")
 	}
-	loop := agentd.NewBackendLoop(agentd.BackendLoopOptions{AgentID: agentID, DeviceID: deviceID, Jobs: jobs, Client: agentd.NewBackendClient(backendURL, nil)})
+	agentToken := agentAuthTokenFromOptions(opts)
+	loop := agentd.NewBackendLoop(agentd.BackendLoopOptions{AgentID: agentID, DeviceID: deviceID, Jobs: jobs, Client: agentd.NewBackendClient(backendURL, nil), AgentAuthToken: agentToken})
+	if agentToken != "" {
+		go func() { _ = loop.RunReceiver(ctx) }()
+	}
 	return agentd.NewLocalRouterWithBackendContext(ctx, jobs, loop), nil
 }
 
@@ -156,6 +168,43 @@ func localSocketPath(opts Options) string {
 		return value
 	}
 	return "/tmp/postamat/agentd.sock"
+}
+
+func agentAuthenticatorFromOptions(opts Options, pepper string) (api.AgentAuthenticator, error) {
+	tokens := opts.AgentTokens
+	if len(tokens) == 0 {
+		parsed, err := parseAgentTokens(os.Getenv("POSTAMAT_AGENT_TOKENS"))
+		if err != nil {
+			return nil, err
+		}
+		tokens = parsed
+	}
+	if len(tokens) == 0 {
+		return nil, nil
+	}
+	return api.NewStaticAgentTokenAuthenticator(tokens, pepper)
+}
+
+func parseAgentTokens(raw string) (map[string]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	tokens := make(map[string]string)
+	for _, entry := range strings.Split(raw, ",") {
+		parts := strings.SplitN(strings.TrimSpace(entry), ":", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || parts[1] == "" {
+			return nil, errors.New("POSTAMAT_AGENT_TOKENS must be comma-separated agent_id:token pairs")
+		}
+		tokens[strings.TrimSpace(parts[0])] = parts[1]
+	}
+	return tokens, nil
+}
+
+func agentAuthTokenFromOptions(opts Options) string {
+	if opts.AgentAuthToken != "" {
+		return opts.AgentAuthToken
+	}
+	return os.Getenv("POSTAMAT_AGENT_TOKEN")
 }
 
 func envOrDefault(key string, fallback string) string {

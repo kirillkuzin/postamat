@@ -123,3 +123,30 @@ func TestRoomManagerDetachPeerRemovesOnlyDisconnectedDevicePresence(t *testing.T
 		t.Fatalf("dev_2 should remain: %+v", presence.Devices)
 	}
 }
+
+func TestRoomManagerDetachTransferPeerKeepsSameDeviceAlwaysOnPresence(t *testing.T) {
+	registry := NewPresenceRegistry(nil)
+	rooms := NewRoomManager(registry, nil)
+	alwaysOn := &recordedPeer{}
+	transferScoped := &recordedPeer{}
+	rooms.AttachPeer("agent_b", "dev_b", alwaysOn)
+	registry.Register(DevicePresence{AgentID: "agent_b", DeviceID: "dev_b"})
+	rooms.AttachTransferPeer("agent_b", "dev_b", "tr_1", transferScoped)
+	registry.Register(DevicePresence{AgentID: "agent_b", DeviceID: "dev_b"})
+
+	rooms.DetachPeer("agent_b", "dev_b", transferScoped)
+
+	presence, ok := registry.Agent("agent_b")
+	if !ok || !presence.Online {
+		t.Fatalf("always-on same-device peer should keep agent online: %+v ok=%v", presence, ok)
+	}
+	if _, ok := presence.Devices["dev_b"]; !ok {
+		t.Fatalf("dev_b presence should remain while always-on peer is attached: %+v", presence.Devices)
+	}
+	if err := rooms.Route(Envelope{Type: MessageTransferOffer, TransferID: "tr_2", FromAgentID: "agent_a", ToAgentID: "agent_b"}); err != nil {
+		t.Fatalf("always-on peer should still receive routed offers: %v", err)
+	}
+	if len(alwaysOn.messages) != 1 || alwaysOn.messages[0].TransferID != "tr_2" {
+		t.Fatalf("always-on peer did not receive routed offer: %+v", alwaysOn.messages)
+	}
+}

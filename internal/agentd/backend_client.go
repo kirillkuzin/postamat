@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/kirillkuzin/postamat/internal/p2p"
@@ -22,6 +23,7 @@ var (
 	ErrBackendClientRequired  = errors.New("backend client is required")
 	ErrOfferRecipientMismatch = errors.New("offer recipient does not match local agent")
 	ErrOfferDeniedByPolicy    = errors.New("offer denied by receive policy")
+	ErrAgentAuthTokenRequired = errors.New("agent auth token is required")
 )
 
 type BackendClient struct {
@@ -144,6 +146,41 @@ func (c *BackendClient) DialAgentWebSocket(ctx context.Context, transferID strin
 	return conn, err
 }
 
+func (c *BackendClient) AgentPresenceWebSocketURL(agentID string) (string, error) {
+	if c == nil || c.baseURL == nil || c.baseURL.String() == "" {
+		return "", ErrBackendURLRequired
+	}
+	endpoint := c.resolve("/api/v1/agents/ws")
+	switch endpoint.Scheme {
+	case "http":
+		endpoint.Scheme = "ws"
+	case "https":
+		endpoint.Scheme = "wss"
+	}
+	query := endpoint.Query()
+	query.Set("agent_id", agentID)
+	endpoint.RawQuery = query.Encode()
+	return endpoint.String(), nil
+}
+
+func (c *BackendClient) DialAgentPresenceWebSocket(ctx context.Context, agentID string, token string) (*websocket.Conn, error) {
+	if token == "" {
+		return nil, ErrAgentAuthTokenRequired
+	}
+	wsURL, err := c.AgentPresenceWebSocketURL(agentID)
+	if err != nil {
+		return nil, err
+	}
+	dialer := c.dialer
+	if dialer == nil {
+		dialer = websocket.DefaultDialer
+	}
+	header := http.Header{}
+	header.Set("Authorization", "Bearer "+token)
+	conn, _, err := dialer.DialContext(ctx, wsURL, header)
+	return conn, err
+}
+
 func (c *BackendClient) resolve(path string) url.URL {
 	resolved := *c.baseURL
 	resolved.Path = strings.TrimRight(c.baseURL.Path, "/") + path
@@ -161,6 +198,7 @@ type BackendLoopOptions struct {
 	AgentPrivateKey     []byte
 	RecipientPublicKeys map[string][]byte
 	GenerateTransferKey func() (p2p.TransferKey, error)
+	AgentAuthToken      string
 }
 
 type ReceivePolicy struct {
@@ -213,6 +251,7 @@ type BackendLoop struct {
 	agentPrivateKey     []byte
 	recipientPublicKeys map[string][]byte
 	generateTransferKey func() (p2p.TransferKey, error)
+	agentAuthToken      string
 }
 
 func NewBackendLoop(options BackendLoopOptions) *BackendLoop {
@@ -234,6 +273,7 @@ func NewBackendLoop(options BackendLoopOptions) *BackendLoop {
 		agentPrivateKey:     append([]byte(nil), options.AgentPrivateKey...),
 		recipientPublicKeys: clonePublicKeys(options.RecipientPublicKeys),
 		generateTransferKey: generateKey,
+		agentAuthToken:      options.AgentAuthToken,
 	}
 }
 
@@ -304,6 +344,88 @@ func (l *BackendLoop) CancelTransfer(ctx context.Context, jobIDOrTransferID stri
 		}
 	}
 	return l.jobs.Cancel(job.ID)
+}
+
+func (l *BackendLoop) ConnectAgentPresence(ctx context.Context) (*websocket.Conn, error) {
+	if l.client == nil {
+		return nil, ErrBackendClientRequired
+	}
+	conn, err := l.client.DialAgentPresenceWebSocket(ctx, l.agentID, l.agentAuthToken)
+	if err != nil {
+		return nil, err
+	}
+	hello := signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: l.agentID, DeviceID: l.deviceID}
+	if err := conn.WriteJSON(hello); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+func (l *BackendLoop) RunReceiver(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if l.agentAuthToken == "" {
+		return ErrAgentAuthTokenRequired
+	}
+	backoff := 100 * time.Millisecond
+	for {
+		if err := l.runReceiverOnce(ctx); err != nil && ctx.Err() != nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil
+		case <-timer.C:
+		}
+		if backoff < 2*time.Second {
+			backoff *= 2
+			if backoff > 2*time.Second {
+				backoff = 2 * time.Second
+			}
+		}
+	}
+}
+
+func (l *BackendLoop) runReceiverOnce(ctx context.Context) error {
+	conn, err := l.ConnectAgentPresence(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+	defer close(done)
+	conn.SetReadLimit(1 << 20)
+	for {
+		var envelope signaling.Envelope
+		if err := conn.ReadJSON(&envelope); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		if err := l.handleEnvelope(ctx, func(reply signaling.Envelope) error { return conn.WriteJSON(reply) }, envelope); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			continue
+		}
+	}
 }
 
 func (l *BackendLoop) RunTransfer(ctx context.Context, job Job) error {

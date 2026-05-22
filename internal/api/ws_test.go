@@ -15,6 +15,99 @@ import (
 	"github.com/kirillkuzin/postamat/internal/signaling"
 )
 
+func TestAuthenticatedAgentWebSocketRequiresBearerToken(t *testing.T) {
+	server := httptest.NewServer(api.NewRouterWithSignalingAndAgentAuth(secureTestService(), signaling.NewPresenceRegistry(nil), nil, testAgentAuth(t, map[string]string{"agent_b": "token-b"})))
+	defer server.Close()
+
+	_, response, err := websocket.DefaultDialer.Dial(wsURL(server.URL+"/api/v1/agents/ws?agent_id=agent_b"), nil)
+	if err == nil {
+		t.Fatalf("expected websocket dial to fail without bearer token")
+	}
+	if response == nil || response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got response=%+v err=%v", response, err)
+	}
+}
+
+func TestAuthenticatedAgentWebSocketRejectsSpoofedHelloAgent(t *testing.T) {
+	server := httptest.NewServer(api.NewRouterWithSignalingAndAgentAuth(secureTestService(), signaling.NewPresenceRegistry(nil), nil, testAgentAuth(t, map[string]string{"agent_b": "token-b"})))
+	defer server.Close()
+
+	conn := dialAuthenticatedAgentWS(t, server.URL, "agent_b", "token-b")
+	defer conn.Close()
+	writeEnvelope(t, conn, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "agent_x", DeviceID: "dev_x"})
+	if got := readEnvelope(t, conn); got.Type != signaling.MessageError {
+		t.Fatalf("expected spoofed hello error, got %+v", got)
+	}
+}
+
+func TestAuthenticatedAgentWebSocketRegistersAlwaysOnPresenceAndReceivesOffer(t *testing.T) {
+	service := secureTestService()
+	created := createWSTransfer(t, service, sessions.TargetAgent)
+	presence := signaling.NewPresenceRegistry(func() time.Time { return time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC) })
+	rooms := signaling.NewRoomManager(presence, nil)
+	server := httptest.NewServer(api.NewRouterWithSignalingAndAgentAuth(service, presence, rooms, testAgentAuth(t, map[string]string{"agent_b": "token-b"})))
+	defer server.Close()
+
+	receiver := dialAuthenticatedAgentWS(t, server.URL, "agent_b", "token-b")
+	defer receiver.Close()
+	writeEnvelope(t, receiver, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "agent_b", DeviceID: "dev_b"})
+	ack := readEnvelope(t, receiver)
+	if ack.Type != signaling.MessageAgentPresence || ack.AgentID != "agent_b" {
+		t.Fatalf("unexpected presence ack: %+v", ack)
+	}
+	if snapshot, ok := presence.Agent("agent_b"); !ok || !snapshot.Online {
+		t.Fatalf("expected agent_b always-on presence, got %+v ok=%v", snapshot, ok)
+	}
+
+	sender := dialWS(t, agentWSURL(server.URL, created))
+	defer sender.Close()
+	writeEnvelope(t, sender, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "agent_a", DeviceID: "dev_a"})
+	readEnvelope(t, sender)
+	writeEnvelope(t, sender, signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: created.Transfer.ID, FromAgentID: "agent_a", ToAgentID: "agent_b"})
+
+	got := readEnvelope(t, receiver)
+	if got.Type != signaling.MessageTransferOffer || got.TransferID != created.Transfer.ID || got.FromAgentID != "agent_a" || got.ToAgentID != "agent_b" {
+		t.Fatalf("always-on receiver got unexpected offer: %+v", got)
+	}
+}
+
+func TestAuthenticatedAgentWebSocketRejectsNonParticipantTransferRoute(t *testing.T) {
+	service := secureTestService()
+	created := createWSTransfer(t, service, sessions.TargetAgent)
+	server := httptest.NewServer(api.NewRouterWithSignalingAndAgentAuth(service, signaling.NewPresenceRegistry(nil), nil, testAgentAuth(t, map[string]string{"agent_x": "token-x"})))
+	defer server.Close()
+
+	conn := dialAuthenticatedAgentWS(t, server.URL, "agent_x", "token-x")
+	defer conn.Close()
+	writeEnvelope(t, conn, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "agent_x", DeviceID: "dev_x"})
+	readEnvelope(t, conn)
+	writeEnvelope(t, conn, signaling.Envelope{Type: signaling.MessageTransferAccepted, TransferID: created.Transfer.ID, FromAgentID: "agent_x", ToAgentID: "agent_a"})
+	if got := readEnvelope(t, conn); got.Type != signaling.MessageError {
+		t.Fatalf("expected non-participant route error, got %+v", got)
+	}
+}
+
+func TestAuthenticatedAgentWebSocketRejectsRoleReversedOffer(t *testing.T) {
+	service := secureTestService()
+	created := createWSTransfer(t, service, sessions.TargetAgent)
+	server := httptest.NewServer(api.NewRouterWithSignalingAndAgentAuth(service, signaling.NewPresenceRegistry(nil), nil, testAgentAuth(t, map[string]string{"agent_a": "token-a", "agent_b": "token-b"})))
+	defer server.Close()
+
+	sender := dialAuthenticatedAgentWS(t, server.URL, "agent_a", "token-a")
+	defer sender.Close()
+	writeEnvelope(t, sender, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "agent_a", DeviceID: "dev_a"})
+	readEnvelope(t, sender)
+
+	conn := dialAuthenticatedAgentWS(t, server.URL, "agent_b", "token-b")
+	defer conn.Close()
+	writeEnvelope(t, conn, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "agent_b", DeviceID: "dev_b"})
+	readEnvelope(t, conn)
+	writeEnvelope(t, conn, signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: created.Transfer.ID, FromAgentID: "agent_b", ToAgentID: "agent_a"})
+	if got := readEnvelope(t, conn); got.Type != signaling.MessageError {
+		t.Fatalf("expected role-reversed offer error, got %+v", got)
+	}
+}
+
 func TestAgentWebSocketRegistersPresenceAfterValidatedHello(t *testing.T) {
 	service := secureTestService()
 	created := createWSTransfer(t, service, sessions.TargetAgent)
@@ -425,6 +518,26 @@ func issueBrowserReceiverTicket(t *testing.T, service *sessions.Service, publicT
 		t.Fatalf("IssueBrowserReceiverTicket: %v", err)
 	}
 	return issued.ReceiverTicket
+}
+
+func testAgentAuth(t *testing.T, tokens map[string]string) api.AgentAuthenticator {
+	t.Helper()
+	authenticator, err := api.NewStaticAgentTokenAuthenticator(tokens, "test-pepper")
+	if err != nil {
+		t.Fatalf("NewStaticAgentTokenAuthenticator: %v", err)
+	}
+	return authenticator
+}
+
+func dialAuthenticatedAgentWS(t *testing.T, baseURL string, agentID string, token string) *websocket.Conn {
+	t.Helper()
+	header := http.Header{}
+	header.Set("Authorization", "Bearer "+token)
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(baseURL+"/api/v1/agents/ws?agent_id="+url.QueryEscape(agentID)), header)
+	if err != nil {
+		t.Fatalf("authenticated websocket dial: %v", err)
+	}
+	return conn
 }
 
 func dialWS(t *testing.T, rawURL string) *websocket.Conn {
