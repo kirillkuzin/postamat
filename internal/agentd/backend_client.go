@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -252,6 +253,13 @@ type BackendLoop struct {
 	recipientPublicKeys map[string][]byte
 	generateTransferKey func() (p2p.TransferKey, error)
 	agentAuthToken      string
+	live                map[string]*liveWebRTCSession
+}
+
+type liveWebRTCSession struct {
+	peer       *p2p.RemoteWebRTCPeer
+	pendingICE []p2p.ICECandidate
+	done       chan error
 }
 
 func NewBackendLoop(options BackendLoopOptions) *BackendLoop {
@@ -274,6 +282,7 @@ func NewBackendLoop(options BackendLoopOptions) *BackendLoop {
 		recipientPublicKeys: clonePublicKeys(options.RecipientPublicKeys),
 		generateTransferKey: generateKey,
 		agentAuthToken:      options.AgentAuthToken,
+		live:                make(map[string]*liveWebRTCSession),
 	}
 }
 
@@ -411,6 +420,12 @@ func (l *BackendLoop) runReceiverOnce(ctx context.Context) error {
 	}()
 	defer close(done)
 	conn.SetReadLimit(1 << 20)
+	var writeMu sync.Mutex
+	send := func(reply signaling.Envelope) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return conn.WriteJSON(reply)
+	}
 	for {
 		var envelope signaling.Envelope
 		if err := conn.ReadJSON(&envelope); err != nil {
@@ -419,9 +434,15 @@ func (l *BackendLoop) runReceiverOnce(ctx context.Context) error {
 			}
 			return err
 		}
-		if err := l.handleEnvelope(ctx, func(reply signaling.Envelope) error { return conn.WriteJSON(reply) }, envelope); err != nil {
+		if err := l.handleEnvelope(ctx, send, envelope); err != nil {
 			if ctx.Err() != nil {
 				return nil
+			}
+			if envelope.TransferID != "" && envelope.FromAgentID != "" {
+				if _, ok := l.jobs.FindByTransferID(envelope.TransferID); ok {
+					_ = l.failTransferJob(envelope.TransferID, err.Error())
+					_ = sendTransferState(send, signaling.MessageTransferFailed, envelope.TransferID, l.agentID, envelope.FromAgentID, nil)
+				}
 			}
 			continue
 		}
@@ -436,6 +457,7 @@ func (l *BackendLoop) RunTransfer(ctx context.Context, job Job) error {
 	if err != nil {
 		return err
 	}
+	defer l.closeLiveSession(job.TransferID)
 	defer conn.Close()
 	done := make(chan struct{})
 	go func() {
@@ -447,29 +469,71 @@ func (l *BackendLoop) RunTransfer(ctx context.Context, job Job) error {
 	}()
 	defer close(done)
 	conn.SetReadLimit(1 << 20)
+	var writeMu sync.Mutex
+	send := func(reply signaling.Envelope) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return conn.WriteJSON(reply)
+	}
 	if job.Direction == JobDirectionSend {
-		if err := l.sendTransferOffer(conn, job); err != nil {
+		if err := l.sendTransferOffer(send, job); err != nil {
 			return err
 		}
 	}
+	readCh := make(chan signaling.Envelope, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		for {
+			var envelope signaling.Envelope
+			if err := conn.ReadJSON(&envelope); err != nil {
+				errCh <- err
+				return
+			}
+			select {
+			case readCh <- envelope:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 	for {
-		var envelope signaling.Envelope
-		if err := conn.ReadJSON(&envelope); err != nil {
+		var doneCh chan error
+		if session := l.liveSession(job.TransferID, false); session != nil {
+			doneCh = session.done
+		}
+		select {
+		case envelope := <-readCh:
+			if envelope.TransferID != "" && envelope.TransferID != job.TransferID {
+				return ErrOfferRecipientMismatch
+			}
+			if err := l.handleEnvelope(ctx, send, envelope); err != nil {
+				return err
+			}
+			switch envelope.Type {
+			case signaling.MessageTransferCompleted:
+				l.closeLiveSession(job.TransferID)
+				return nil
+			case signaling.MessageTransferFailed, signaling.MessageTransferDenied, signaling.MessageTransferExpired, signaling.MessageTransferCancelled:
+				l.closeLiveSession(job.TransferID)
+				return p2p.ErrTransferFailed
+			}
+		case err := <-doneCh:
+			if err != nil {
+				l.closeLiveSession(job.TransferID)
+				return err
+			}
+		case err := <-errCh:
 			if ctx.Err() != nil {
 				return nil
 			}
 			return err
-		}
-		if envelope.TransferID != "" && envelope.TransferID != job.TransferID {
-			return ErrOfferRecipientMismatch
-		}
-		if err := l.handleEnvelope(ctx, func(reply signaling.Envelope) error { return conn.WriteJSON(reply) }, envelope); err != nil {
-			return err
+		case <-ctx.Done():
+			return nil
 		}
 	}
 }
 
-func (l *BackendLoop) sendTransferOffer(conn *websocket.Conn, job Job) error {
+func (l *BackendLoop) sendTransferOffer(send func(signaling.Envelope) error, job Job) error {
 	payloadData := transferOfferPayload{
 		FileName:      job.FileName,
 		FileSizeBytes: job.FileSizeBytes,
@@ -489,7 +553,7 @@ func (l *BackendLoop) sendTransferOffer(conn *websocket.Conn, job Job) error {
 	if err != nil {
 		return err
 	}
-	return conn.WriteJSON(signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: job.TransferID, FromAgentID: l.agentID, ToAgentID: job.ToAgentID, Payload: payload})
+	return send(signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: job.TransferID, FromAgentID: l.agentID, ToAgentID: job.ToAgentID, Payload: payload})
 }
 
 func (l *BackendLoop) ConnectTransfer(ctx context.Context, transferID string, ticket string) (*websocket.Conn, error) {
@@ -524,13 +588,31 @@ func (l *BackendLoop) handleEnvelope(ctx context.Context, send func(signaling.En
 	case signaling.MessageTransferOffer:
 		return l.handleTransferOffer(send, envelope)
 	case signaling.MessageTransferAccepted:
-		return l.updateTransferJob(envelope.TransferID, l.jobs.MarkAccepted)
-	case signaling.MessageTransferStarted:
-		if err := l.updateTransferJob(envelope.TransferID, l.jobs.MarkConnecting); err != nil {
+		if err := l.validateIncomingTransferEnvelope(envelope); err != nil {
 			return err
 		}
-		return l.updateTransferJob(envelope.TransferID, l.jobs.MarkTransferring)
+		if err := l.updateTransferJob(envelope.TransferID, l.jobs.MarkAccepted); err != nil && !errors.Is(err, ErrInvalidJobStatus) {
+			return err
+		}
+		return l.startSenderWebRTC(ctx, send, envelope.TransferID, envelope.FromAgentID)
+	case signaling.MessageWebRTCOffer:
+		return l.handleWebRTCOffer(ctx, send, envelope)
+	case signaling.MessageWebRTCAnswer:
+		return l.handleWebRTCAnswer(ctx, send, envelope)
+	case signaling.MessageWebRTCICE:
+		return l.handleWebRTCICE(envelope)
+	case signaling.MessageTransferStarted:
+		if err := l.validateIncomingTransferEnvelope(envelope); err != nil {
+			return err
+		}
+		if err := l.markTransferStarted(envelope.TransferID); err != nil {
+			return err
+		}
+		return nil
 	case signaling.MessageTransferProgress:
+		if err := l.validateIncomingTransferEnvelope(envelope); err != nil {
+			return err
+		}
 		if envelope.TransferID == "" {
 			return ErrTransferIDRequired
 		}
@@ -546,17 +628,40 @@ func (l *BackendLoop) handleEnvelope(ctx context.Context, send func(signaling.En
 		if !ok {
 			return ErrJobNotFound
 		}
+		if job.isTerminal() {
+			return nil
+		}
 		_, err := l.jobs.UpdateProgress(job.ID, payload.ProgressBytes)
 		return err
 	case signaling.MessageTransferCompleted:
-		return l.updateTransferJob(envelope.TransferID, l.jobs.Complete)
+		if err := l.validateIncomingTransferEnvelope(envelope); err != nil {
+			return err
+		}
+		job, ok := l.jobs.FindByTransferID(envelope.TransferID)
+		if !ok {
+			return ErrJobNotFound
+		}
+		if job.Direction == JobDirectionReceive {
+			return signaling.ErrRouteTargetRequired
+		}
+		return l.completeTransferJob(envelope.TransferID)
 	case signaling.MessageTransferFailed:
+		if err := l.validateIncomingTransferEnvelope(envelope); err != nil {
+			return err
+		}
+		l.closeLiveSession(envelope.TransferID)
 		return l.failTransferJob(envelope.TransferID, "remote transfer failed")
 	case signaling.MessageTransferDenied:
+		if err := l.validateIncomingTransferEnvelope(envelope); err != nil {
+			return err
+		}
+		l.closeLiveSession(envelope.TransferID)
 		return l.failTransferJob(envelope.TransferID, "remote transfer denied")
 	case signaling.MessageTransferExpired:
+		l.closeLiveSession(envelope.TransferID)
 		return l.failTransferJob(envelope.TransferID, "remote transfer expired")
 	case signaling.MessageTransferCancelled:
+		l.closeLiveSession(envelope.TransferID)
 		return l.updateTransferJob(envelope.TransferID, l.jobs.Cancel)
 	default:
 		return nil
@@ -587,6 +692,15 @@ func (l *BackendLoop) handleTransferOffer(send func(signaling.Envelope) error, e
 			return nil
 		}
 		return ErrOfferDeniedByPolicy
+	}
+	if payload.KeyEnvelope == nil {
+		if err := l.sendOfferDecision(send, envelope, false, "transfer_key_required"); err != nil {
+			return err
+		}
+		if send != nil {
+			return nil
+		}
+		return ErrTransferKeyRequired
 	}
 	var transferKey p2p.TransferKey
 	hasTransferKey := false
@@ -643,6 +757,377 @@ func (l *BackendLoop) sendOfferDecision(send func(signaling.Envelope) error, off
 	return send(decision)
 }
 
+func (l *BackendLoop) validateIncomingTransferEnvelope(envelope signaling.Envelope) error {
+	if envelope.TransferID == "" {
+		return ErrTransferIDRequired
+	}
+	job, ok := l.jobs.FindByTransferID(envelope.TransferID)
+	if !ok {
+		return ErrJobNotFound
+	}
+	if envelope.ToAgentID != "" && envelope.ToAgentID != l.agentID {
+		return ErrOfferRecipientMismatch
+	}
+	if envelope.FromAgentID != "" && envelope.FromAgentID != expectedPeerAgentID(job) {
+		return ErrOfferRecipientMismatch
+	}
+	return nil
+}
+
+func expectedPeerAgentID(job Job) string {
+	if job.Direction == JobDirectionSend {
+		return job.ToAgentID
+	}
+	return job.FromAgentID
+}
+
+const maxPendingLiveICECandidates = 64
+
+func (l *BackendLoop) startSenderWebRTC(ctx context.Context, send func(signaling.Envelope) error, transferID string, peerAgentID string) error {
+	if send == nil {
+		return nil
+	}
+	job, ok := l.jobs.FindByTransferID(transferID)
+	if !ok {
+		return ErrJobNotFound
+	}
+	if job.Direction != JobDirectionSend {
+		return ErrTransferJobMismatch
+	}
+	if !job.HasTransferKey {
+		return ErrTransferKeyRequired
+	}
+	session := l.liveSession(transferID, true)
+	if session.peer != nil {
+		return nil
+	}
+	peer, err := p2p.NewRemoteWebRTCOfferPeer("postamat-transfer", func(candidate p2p.ICECandidate) {
+		_ = sendWebRTCPayload(send, signaling.MessageWebRTCICE, transferID, l.agentID, peerAgentID, candidate)
+	})
+	if err != nil {
+		return err
+	}
+	session.peer = peer
+	l.flushLiveSessionICE(session)
+	offer, err := peer.CreateOffer()
+	if err != nil {
+		return err
+	}
+	return sendWebRTCPayload(send, signaling.MessageWebRTCOffer, transferID, l.agentID, peerAgentID, offer)
+}
+
+func (l *BackendLoop) handleWebRTCOffer(ctx context.Context, send func(signaling.Envelope) error, envelope signaling.Envelope) error {
+	if send == nil {
+		return nil
+	}
+	if err := l.validateIncomingTransferEnvelope(envelope); err != nil {
+		return err
+	}
+	var offer p2p.SessionDescription
+	if err := json.Unmarshal(envelope.Payload, &offer); err != nil {
+		return err
+	}
+	job, ok := l.jobs.FindByTransferID(envelope.TransferID)
+	if !ok {
+		return ErrJobNotFound
+	}
+	if job.Direction != JobDirectionReceive {
+		return ErrTransferJobMismatch
+	}
+	if !job.HasTransferKey {
+		return ErrTransferKeyRequired
+	}
+	session := l.liveSession(envelope.TransferID, true)
+	if session.peer == nil {
+		peer, err := p2p.NewRemoteWebRTCAnswerPeer(func(candidate p2p.ICECandidate) {
+			_ = sendWebRTCPayload(send, signaling.MessageWebRTCICE, envelope.TransferID, l.agentID, envelope.FromAgentID, candidate)
+		})
+		if err != nil {
+			return err
+		}
+		session.peer = peer
+	}
+	answer, err := session.peer.AcceptOfferCreateAnswer(offer)
+	if err != nil {
+		return err
+	}
+	l.flushLiveSessionICE(session)
+	if err := sendWebRTCPayload(send, signaling.MessageWebRTCAnswer, envelope.TransferID, l.agentID, envelope.FromAgentID, answer); err != nil {
+		return err
+	}
+	go l.runLiveReceiver(ctx, send, job, session)
+	return nil
+}
+
+func (l *BackendLoop) handleWebRTCAnswer(ctx context.Context, send func(signaling.Envelope) error, envelope signaling.Envelope) error {
+	if err := l.validateIncomingTransferEnvelope(envelope); err != nil {
+		return err
+	}
+	var answer p2p.SessionDescription
+	if err := json.Unmarshal(envelope.Payload, &answer); err != nil {
+		return err
+	}
+	session := l.liveSession(envelope.TransferID, false)
+	if session == nil || session.peer == nil {
+		return ErrTransferIDRequired
+	}
+	if err := session.peer.AcceptAnswer(answer); err != nil {
+		return err
+	}
+	job, ok := l.jobs.FindByTransferID(envelope.TransferID)
+	if !ok {
+		return ErrJobNotFound
+	}
+	go l.runLiveSender(ctx, send, job, envelope.FromAgentID, session)
+	return nil
+}
+
+func (l *BackendLoop) handleWebRTCICE(envelope signaling.Envelope) error {
+	if err := l.validateIncomingTransferEnvelope(envelope); err != nil {
+		return err
+	}
+	job, ok := l.jobs.FindByTransferID(envelope.TransferID)
+	if !ok {
+		return ErrJobNotFound
+	}
+	if job.isTerminal() {
+		return nil
+	}
+	var candidate p2p.ICECandidate
+	if err := json.Unmarshal(envelope.Payload, &candidate); err != nil {
+		return err
+	}
+	session := l.liveSession(envelope.TransferID, false)
+	if session == nil || session.peer == nil {
+		session = l.liveSession(envelope.TransferID, true)
+		if len(session.pendingICE) >= maxPendingLiveICECandidates {
+			return p2p.ErrTransferFailed
+		}
+		session.pendingICE = append(session.pendingICE, candidate)
+		return nil
+	}
+	return session.peer.AddICECandidate(candidate)
+}
+
+func (l *BackendLoop) runLiveSender(ctx context.Context, send func(signaling.Envelope) error, job Job, peerAgentID string, session *liveWebRTCSession) {
+	session.done <- l.runLiveSenderOnce(ctx, send, job, peerAgentID, session)
+}
+
+func (l *BackendLoop) runLiveSenderOnce(ctx context.Context, send func(signaling.Envelope) error, job Job, peerAgentID string, session *liveWebRTCSession) error {
+	if !job.HasTransferKey {
+		return ErrTransferKeyRequired
+	}
+	channel, err := session.peer.WaitOutboundDataChannel(ctx, 64*1024)
+	if err != nil {
+		_ = l.failTransferJob(job.TransferID, err.Error())
+		_ = sendTransferState(send, signaling.MessageTransferFailed, job.TransferID, l.agentID, peerAgentID, nil)
+		return err
+	}
+	if err := l.markTransferStarted(job.TransferID); err != nil {
+		return err
+	}
+	_ = sendTransferState(send, signaling.MessageTransferStarted, job.TransferID, l.agentID, peerAgentID, nil)
+	source, err := os.Open(job.SourcePath)
+	if err != nil {
+		_ = l.failTransferJob(job.TransferID, err.Error())
+		_ = sendTransferState(send, signaling.MessageTransferFailed, job.TransferID, l.agentID, peerAgentID, nil)
+		return err
+	}
+	defer source.Close()
+	info, err := source.Stat()
+	if err != nil {
+		_ = l.failTransferJob(job.TransferID, err.Error())
+		_ = sendTransferState(send, signaling.MessageTransferFailed, job.TransferID, l.agentID, peerAgentID, nil)
+		return err
+	}
+	if info.Size() != job.FileSizeBytes {
+		err := fmt.Errorf("source size %d does not match declared transfer size %d", info.Size(), job.FileSizeBytes)
+		_ = l.failTransferJob(job.TransferID, err.Error())
+		_ = sendTransferState(send, signaling.MessageTransferFailed, job.TransferID, l.agentID, peerAgentID, nil)
+		return err
+	}
+	cipher, err := p2p.NewChunkCipher(job.TransferKey)
+	if err != nil {
+		_ = l.failTransferJob(job.TransferID, err.Error())
+		_ = sendTransferState(send, signaling.MessageTransferFailed, job.TransferID, l.agentID, peerAgentID, nil)
+		return err
+	}
+	_, err = p2p.StreamReader(ctx, job.TransferID, source, channel, p2p.SenderOptions{
+		Encryption: cipher,
+		OnProgress: func(progress p2p.Progress) {
+			_, _ = l.jobs.UpdateProgress(job.ID, progress.BytesTransferred)
+			_ = sendProgress(send, job.TransferID, l.agentID, peerAgentID, progress.BytesTransferred)
+		},
+	})
+	if err != nil {
+		_ = l.failTransferJob(job.TransferID, err.Error())
+		_ = sendTransferState(send, signaling.MessageTransferFailed, job.TransferID, l.agentID, peerAgentID, nil)
+		return err
+	}
+	return nil
+}
+
+func (l *BackendLoop) runLiveReceiver(ctx context.Context, send func(signaling.Envelope) error, job Job, session *liveWebRTCSession) {
+	defer l.closeLiveSession(job.TransferID)
+	session.done <- l.runLiveReceiverOnce(ctx, send, job, session)
+}
+
+func (l *BackendLoop) runLiveReceiverOnce(ctx context.Context, send func(signaling.Envelope) error, job Job, session *liveWebRTCSession) error {
+	incoming, err := session.peer.WaitIncomingMessages(ctx)
+	if err != nil {
+		_ = l.failTransferJob(job.TransferID, err.Error())
+		_ = sendTransferState(send, signaling.MessageTransferFailed, job.TransferID, l.agentID, job.FromAgentID, nil)
+		return err
+	}
+	if err := l.markTransferStarted(job.TransferID); err != nil {
+		return err
+	}
+	_ = sendTransferState(send, signaling.MessageTransferStarted, job.TransferID, l.agentID, job.FromAgentID, nil)
+	if job.DestinationPath == "" {
+		_ = l.failTransferJob(job.TransferID, ErrDestinationPathRequired.Error())
+		_ = sendTransferState(send, signaling.MessageTransferFailed, job.TransferID, l.agentID, job.FromAgentID, nil)
+		return ErrDestinationPathRequired
+	}
+	if _, err := os.Lstat(job.DestinationPath); err == nil {
+		err = fmt.Errorf("destination exists: %s", job.DestinationPath)
+		_ = l.failTransferJob(job.TransferID, err.Error())
+		_ = sendTransferState(send, signaling.MessageTransferFailed, job.TransferID, l.agentID, job.FromAgentID, nil)
+		return err
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	partialPath := job.DestinationPath + ".part"
+	destination, err := os.OpenFile(partialPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		_ = l.failTransferJob(job.TransferID, err.Error())
+		_ = sendTransferState(send, signaling.MessageTransferFailed, job.TransferID, l.agentID, job.FromAgentID, nil)
+		return err
+	}
+	partialCommitted := false
+	defer func() {
+		_ = destination.Close()
+		if !partialCommitted {
+			_ = os.Remove(partialPath)
+		}
+	}()
+	cipher, err := p2p.NewChunkCipher(job.TransferKey)
+	if err != nil {
+		_ = l.failTransferJob(job.TransferID, err.Error())
+		_ = sendTransferState(send, signaling.MessageTransferFailed, job.TransferID, l.agentID, job.FromAgentID, nil)
+		return err
+	}
+	receiver := p2p.NewReceiver(job.TransferID, destination, p2p.ReceiverOptions{
+		Encryption:        cipher,
+		RequireEncryption: true,
+		OnProgress: func(progress p2p.Progress) {
+			_, _ = l.jobs.UpdateProgress(job.ID, progress.BytesTransferred)
+			_ = sendProgress(send, job.TransferID, l.agentID, job.FromAgentID, progress.BytesTransferred)
+		},
+	})
+	for {
+		select {
+		case <-ctx.Done():
+			err := fmt.Errorf("%w: %v", p2p.ErrTransferFailed, ctx.Err())
+			_ = l.failTransferJob(job.TransferID, err.Error())
+			_ = sendTransferState(send, signaling.MessageTransferFailed, job.TransferID, l.agentID, job.FromAgentID, nil)
+			return err
+		case <-session.peer.Done():
+			err := fmt.Errorf("%w: remote peer closed", p2p.ErrTransferFailed)
+			_ = l.failTransferJob(job.TransferID, err.Error())
+			_ = sendTransferState(send, signaling.MessageTransferFailed, job.TransferID, l.agentID, job.FromAgentID, nil)
+			return err
+		case message := <-incoming:
+			manifest, err := receiver.Accept(message)
+			if err != nil {
+				_ = l.failTransferJob(job.TransferID, err.Error())
+				_ = sendTransferState(send, signaling.MessageTransferFailed, job.TransferID, l.agentID, job.FromAgentID, nil)
+				return err
+			}
+			if manifest == nil {
+				continue
+			}
+			if manifest.TotalBytes != job.FileSizeBytes {
+				err := fmt.Errorf("manifest total %d does not match declared transfer size %d", manifest.TotalBytes, job.FileSizeBytes)
+				_ = l.failTransferJob(job.TransferID, err.Error())
+				_ = sendTransferState(send, signaling.MessageTransferFailed, job.TransferID, l.agentID, job.FromAgentID, nil)
+				return err
+			}
+			if err := destination.Close(); err != nil {
+				return err
+			}
+			if err := commitDestinationNoReplace(partialPath, job.DestinationPath); err != nil {
+				_ = l.failTransferJob(job.TransferID, err.Error())
+				_ = sendTransferState(send, signaling.MessageTransferFailed, job.TransferID, l.agentID, job.FromAgentID, nil)
+				return err
+			}
+			partialCommitted = true
+			if err := l.completeTransferJob(job.TransferID); err != nil {
+				return err
+			}
+			_ = sendTransferState(send, signaling.MessageTransferCompleted, job.TransferID, l.agentID, job.FromAgentID, nil)
+			return nil
+		}
+	}
+}
+
+func (l *BackendLoop) liveSession(transferID string, create bool) *liveWebRTCSession {
+	if transferID == "" {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	session := l.live[transferID]
+	if session == nil && create {
+		session = &liveWebRTCSession{done: make(chan error, 1)}
+		l.live[transferID] = session
+	}
+	return session
+}
+
+func (l *BackendLoop) closeLiveSession(transferID string) {
+	l.mu.Lock()
+	session := l.live[transferID]
+	delete(l.live, transferID)
+	l.mu.Unlock()
+	if session != nil && session.peer != nil {
+		session.peer.Close()
+	}
+}
+
+func (l *BackendLoop) flushLiveSessionICE(session *liveWebRTCSession) {
+	if session == nil || session.peer == nil {
+		return
+	}
+	pending := append([]p2p.ICECandidate(nil), session.pendingICE...)
+	session.pendingICE = nil
+	for _, candidate := range pending {
+		_ = session.peer.AddICECandidate(candidate)
+	}
+}
+
+func sendWebRTCPayload(send func(signaling.Envelope) error, messageType signaling.MessageType, transferID string, fromAgentID string, toAgentID string, payload any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return sendTransferState(send, messageType, transferID, fromAgentID, toAgentID, data)
+}
+
+func sendProgress(send func(signaling.Envelope) error, transferID string, fromAgentID string, toAgentID string, progressBytes int64) error {
+	payload, err := json.Marshal(map[string]int64{"progress_bytes": progressBytes})
+	if err != nil {
+		return err
+	}
+	return sendTransferState(send, signaling.MessageTransferProgress, transferID, fromAgentID, toAgentID, payload)
+}
+
+func sendTransferState(send func(signaling.Envelope) error, messageType signaling.MessageType, transferID string, fromAgentID string, toAgentID string, payload json.RawMessage) error {
+	if send == nil {
+		return nil
+	}
+	return send(signaling.Envelope{Type: messageType, TransferID: transferID, FromAgentID: fromAgentID, ToAgentID: toAgentID, Payload: payload})
+}
+
 func (l *BackendLoop) updateTransferJob(transferID string, update func(string) (Job, error)) error {
 	if transferID == "" {
 		return ErrTransferIDRequired
@@ -655,6 +1140,46 @@ func (l *BackendLoop) updateTransferJob(transferID string, update func(string) (
 	return err
 }
 
+func (l *BackendLoop) markTransferStarted(transferID string) error {
+	if transferID == "" {
+		return ErrTransferIDRequired
+	}
+	job, ok := l.jobs.FindByTransferID(transferID)
+	if !ok {
+		return ErrJobNotFound
+	}
+	switch job.Status {
+	case JobStatusAccepted:
+		if _, err := l.jobs.MarkConnecting(job.ID); err != nil {
+			return err
+		}
+		_, err := l.jobs.MarkTransferring(job.ID)
+		return err
+	case JobStatusConnecting:
+		_, err := l.jobs.MarkTransferring(job.ID)
+		return err
+	case JobStatusTransferring, JobStatusCompleted:
+		return nil
+	default:
+		return ErrInvalidJobStatus
+	}
+}
+
+func (l *BackendLoop) completeTransferJob(transferID string) error {
+	if transferID == "" {
+		return ErrTransferIDRequired
+	}
+	job, ok := l.jobs.FindByTransferID(transferID)
+	if !ok {
+		return ErrJobNotFound
+	}
+	if job.Status == JobStatusCompleted {
+		return nil
+	}
+	_, err := l.jobs.Complete(job.ID)
+	return err
+}
+
 func (l *BackendLoop) failTransferJob(transferID string, reason string) error {
 	if transferID == "" {
 		return ErrTransferIDRequired
@@ -662,6 +1187,9 @@ func (l *BackendLoop) failTransferJob(transferID string, reason string) error {
 	job, ok := l.jobs.FindByTransferID(transferID)
 	if !ok {
 		return ErrJobNotFound
+	}
+	if job.isTerminal() {
+		return nil
 	}
 	_, err := l.jobs.Fail(job.ID, reason)
 	return err

@@ -9,12 +9,15 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/kirillkuzin/postamat/internal/api"
 	"github.com/kirillkuzin/postamat/internal/p2p"
 	"github.com/kirillkuzin/postamat/internal/sessions"
 	"github.com/kirillkuzin/postamat/internal/signaling"
@@ -54,6 +57,113 @@ func TestBackendClientCreatesTransfer(t *testing.T) {
 	}
 	if created.TransferID != "tr_123" || created.AgentTicket != "ticket_123" {
 		t.Fatalf("unexpected created transfer: %+v", created)
+	}
+}
+
+func TestBackendLoopLiveTwoAgentWebRTCRuntimeTransfersInboxFile(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	payload := []byte("live backend-routed encrypted webrtc payload")
+	sourceDir := t.TempDir()
+	sourcePath := filepath.Join(sourceDir, "payload.txt")
+	if err := os.WriteFile(sourcePath, payload, 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+
+	service := sessions.NewService(sessions.NewMemoryRepository(), sessions.RandomTokenIssuer{}, nil)
+	authenticator, err := api.NewStaticAgentTokenAuthenticator(map[string]string{"agent-b": "token-b"}, "test-pepper")
+	if err != nil {
+		t.Fatalf("NewStaticAgentTokenAuthenticator: %v", err)
+	}
+	server := httptest.NewServer(api.NewRouterWithSignalingAndAgentAuth(service, signaling.NewPresenceRegistry(nil), nil, authenticator))
+	defer server.Close()
+
+	recipientPrivate, recipientPublic, err := p2p.GenerateAgentEnvelopeKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateAgentEnvelopeKeyPair: %v", err)
+	}
+	transferKey, err := p2p.NewRandomTransferKey()
+	if err != nil {
+		t.Fatalf("NewRandomTransferKey: %v", err)
+	}
+	sendJobs := NewJobManager(nil)
+	receiveJobs := NewJobManager(nil)
+	inbox := NewInbox(t.TempDir(), nil)
+	client := NewBackendClient(server.URL, server.Client())
+	senderLoop := NewBackendLoop(BackendLoopOptions{
+		AgentID:             "agent-a",
+		DeviceID:            "dev-a",
+		Jobs:                sendJobs,
+		Client:              client,
+		RecipientPublicKeys: map[string][]byte{"agent-b": recipientPublic},
+		GenerateTransferKey: func() (p2p.TransferKey, error) { return transferKey, nil },
+	})
+	receiverLoop := NewBackendLoop(BackendLoopOptions{
+		AgentID:         "agent-b",
+		DeviceID:        "dev-b",
+		Jobs:            receiveJobs,
+		Inbox:           inbox,
+		Client:          client,
+		AgentAuthToken:  "token-b",
+		AgentPrivateKey: recipientPrivate,
+	})
+
+	receiverDone := make(chan error, 1)
+	go func() { receiverDone <- receiverLoop.RunReceiver(ctx) }()
+
+	sendJob, err := senderLoop.CreateSendTransfer(ctx, CreateSendJobInput{SourcePath: sourcePath, ToAgentID: "agent-b", FileName: "payload.txt", FileSizeBytes: int64(len(payload))})
+	if err != nil {
+		t.Fatalf("CreateSendTransfer: %v", err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- senderLoop.RunTransfer(ctx, sendJob) }()
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("RunTransfer: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for sender transfer: %v", ctx.Err())
+	}
+	cancel()
+	select {
+	case err := <-receiverDone:
+		if err != nil {
+			t.Fatalf("RunReceiver returned error after cancellation: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunReceiver did not stop after cancellation")
+	}
+
+	entries := inbox.List()
+	if len(entries) != 1 {
+		t.Fatalf("inbox entries = %d, want 1: %+v", len(entries), entries)
+	}
+	written, err := os.ReadFile(entries[0].DestinationPath)
+	if err != nil {
+		t.Fatalf("read destination: %v", err)
+	}
+	if string(written) != string(payload) {
+		t.Fatalf("destination payload = %q", string(written))
+	}
+	if _, err := os.Stat(entries[0].DestinationPath + ".part"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial file should be removed, stat err=%v", err)
+	}
+	finalSend, ok := sendJobs.FindByTransferID(sendJob.TransferID)
+	if !ok {
+		t.Fatal("missing final send job")
+	}
+	finalReceive, ok := receiveJobs.FindByTransferID(sendJob.TransferID)
+	if !ok {
+		t.Fatal("missing final receive job")
+	}
+	if finalSend.Status != JobStatusCompleted || finalSend.ProgressBytes != int64(len(payload)) {
+		t.Fatalf("send job not completed with full progress: %+v", finalSend)
+	}
+	if finalReceive.Status != JobStatusCompleted || finalReceive.ProgressBytes != int64(len(payload)) {
+		t.Fatalf("receive job not completed with full progress: %+v", finalReceive)
 	}
 }
 
@@ -140,8 +250,9 @@ func TestBackendLoopSendsHelloAndHeartbeatOverWebSocket(t *testing.T) {
 func TestBackendLoopHandlesIncomingOffer(t *testing.T) {
 	manager := NewJobManager(func() time.Time { return time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC) })
 	inbox := NewInbox(t.TempDir(), func() time.Time { return time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC) })
-	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-1", Jobs: manager, Inbox: inbox, Client: NewBackendClient("https://postamat.example", nil)})
-	envelope := signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: "tr_offer", FromAgentID: "agent-a", ToAgentID: "agent-b", Payload: json.RawMessage(`{"file_name":"payload.bin","file_size_bytes":99}`)}
+	payload, _, privateKey := keyedAgentOfferPayloadForTest(t, "agent-b", "payload.bin", 99)
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-1", Jobs: manager, Inbox: inbox, Client: NewBackendClient("https://postamat.example", nil), AgentPrivateKey: privateKey})
+	envelope := signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: "tr_offer", FromAgentID: "agent-a", ToAgentID: "agent-b", Payload: payload}
 	if err := loop.HandleEnvelope(context.Background(), envelope); err != nil {
 		t.Fatalf("HandleEnvelope returned error: %v", err)
 	}
@@ -201,8 +312,8 @@ func TestBackendLoopRejectsPrematureCompletion(t *testing.T) {
 		t.Fatalf("CreateReceiveJob returned error: %v", err)
 	}
 	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-1", Jobs: manager, Client: NewBackendClient("https://postamat.example", nil)})
-	if err := loop.HandleEnvelope(context.Background(), signaling.Envelope{Type: signaling.MessageTransferCompleted, TransferID: "tr_1"}); !errors.Is(err, ErrInvalidJobStatus) {
-		t.Fatalf("premature completed error = %v, want ErrInvalidJobStatus", err)
+	if err := loop.HandleEnvelope(context.Background(), signaling.Envelope{Type: signaling.MessageTransferCompleted, TransferID: "tr_1"}); !errors.Is(err, signaling.ErrRouteTargetRequired) {
+		t.Fatalf("premature completed error = %v, want ErrRouteTargetRequired", err)
 	}
 	after, err := manager.Get(job.ID)
 	if err != nil {
@@ -249,8 +360,9 @@ func TestBackendLoopHandlesRemoteTerminalMessages(t *testing.T) {
 func TestBackendLoopIgnoresDuplicateOfferForSameTransfer(t *testing.T) {
 	manager := NewJobManager(nil)
 	inbox := NewInbox(t.TempDir(), nil)
-	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-1", Jobs: manager, Inbox: inbox, Client: NewBackendClient("https://postamat.example", nil)})
-	envelope := signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: "tr_dup", FromAgentID: "agent-a", ToAgentID: "agent-b", Payload: json.RawMessage(`{"file_name":"payload.bin","file_size_bytes":99}`)}
+	payload, _, privateKey := keyedAgentOfferPayloadForTest(t, "agent-b", "payload.bin", 99)
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-1", Jobs: manager, Inbox: inbox, Client: NewBackendClient("https://postamat.example", nil), AgentPrivateKey: privateKey})
+	envelope := signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: "tr_dup", FromAgentID: "agent-a", ToAgentID: "agent-b", Payload: payload}
 	if err := loop.HandleEnvelope(context.Background(), envelope); err != nil {
 		t.Fatalf("first HandleEnvelope returned error: %v", err)
 	}
@@ -273,8 +385,9 @@ func TestBackendLoopIgnoresDuplicateOfferForSameTransfer(t *testing.T) {
 func TestBackendLoopHandlesConcurrentDuplicateOffersIdempotently(t *testing.T) {
 	manager := NewJobManager(nil)
 	inbox := NewInbox(t.TempDir(), nil)
-	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-1", Jobs: manager, Inbox: inbox, Client: NewBackendClient("https://postamat.example", nil)})
-	envelope := signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: "tr_concurrent", FromAgentID: "agent-a", ToAgentID: "agent-b", Payload: json.RawMessage(`{"file_name":"payload.bin","file_size_bytes":99}`)}
+	payload, _, privateKey := keyedAgentOfferPayloadForTest(t, "agent-b", "payload.bin", 99)
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-1", Jobs: manager, Inbox: inbox, Client: NewBackendClient("https://postamat.example", nil), AgentPrivateKey: privateKey})
+	envelope := signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: "tr_concurrent", FromAgentID: "agent-a", ToAgentID: "agent-b", Payload: payload}
 
 	var wg sync.WaitGroup
 	errs := make(chan error, 16)
@@ -462,6 +575,7 @@ func TestBackendLoopWritesAcceptedOrDeniedDecisionOverWebSocket(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			messages := make(chan signaling.Envelope, 3)
+			offerPayload, _, privateKey := keyedAgentOfferPayloadForTest(t, "agent-b", "payload.bin", tt.fileSize)
 			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 				conn, err := upgrader.Upgrade(w, req, nil)
@@ -474,7 +588,6 @@ func TestBackendLoopWritesAcceptedOrDeniedDecisionOverWebSocket(t *testing.T) {
 					t.Fatalf("read hello: %v", err)
 				}
 				messages <- hello
-				offerPayload, _ := json.Marshal(map[string]any{"file_name": "payload.bin", "file_size_bytes": tt.fileSize})
 				if err := conn.WriteJSON(signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: "tr_policy", FromAgentID: "agent-a", ToAgentID: "agent-b", Payload: offerPayload}); err != nil {
 					t.Fatalf("write offer: %v", err)
 				}
@@ -489,7 +602,7 @@ func TestBackendLoopWritesAcceptedOrDeniedDecisionOverWebSocket(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			manager := NewJobManager(nil)
-			loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-1", Jobs: manager, Inbox: NewInbox(t.TempDir(), nil), Client: NewBackendClient(server.URL, server.Client()), ReceivePolicy: tt.policy})
+			loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-1", Jobs: manager, Inbox: NewInbox(t.TempDir(), nil), Client: NewBackendClient(server.URL, server.Client()), ReceivePolicy: tt.policy, AgentPrivateKey: privateKey})
 			runErr := make(chan error, 1)
 			go func() {
 				runErr <- loop.RunTransfer(ctx, Job{Direction: JobDirectionReceive, TransferID: "tr_policy", AgentTicket: "ticket-b"})
@@ -578,6 +691,7 @@ func TestBackendLoopRunReceiverSendsHelloOnAlwaysOnSocket(t *testing.T) {
 
 func TestBackendLoopRunReceiverAcceptsOfferOverAlwaysOnSocket(t *testing.T) {
 	messages := make(chan signaling.Envelope, 2)
+	payload, _, privateKey := keyedAgentOfferPayloadForTest(t, "agent-b", "payload.bin", 99)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 		conn, err := upgrader.Upgrade(w, req, nil)
@@ -590,7 +704,6 @@ func TestBackendLoopRunReceiverAcceptsOfferOverAlwaysOnSocket(t *testing.T) {
 			t.Fatalf("read hello: %v", err)
 		}
 		messages <- hello
-		payload := json.RawMessage(`{"file_name":"payload.bin","file_size_bytes":99}`)
 		if err := conn.WriteJSON(signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: "tr_offer", FromAgentID: "agent-a", ToAgentID: "agent-b", Payload: payload}); err != nil {
 			t.Fatalf("write offer: %v", err)
 		}
@@ -606,7 +719,7 @@ func TestBackendLoopRunReceiverAcceptsOfferOverAlwaysOnSocket(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	manager := NewJobManager(nil)
-	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-b", Jobs: manager, Inbox: NewInbox(t.TempDir(), nil), Client: NewBackendClient(server.URL, server.Client()), AgentAuthToken: "token-b"})
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-b", Jobs: manager, Inbox: NewInbox(t.TempDir(), nil), Client: NewBackendClient(server.URL, server.Client()), AgentAuthToken: "token-b", AgentPrivateKey: privateKey})
 	runErr := make(chan error, 1)
 	go func() { runErr <- loop.RunReceiver(ctx) }()
 
@@ -632,6 +745,7 @@ func TestBackendLoopRunReceiverAcceptsOfferOverAlwaysOnSocket(t *testing.T) {
 
 func TestBackendLoopRunReceiverIgnoresBadStateMessageAndContinues(t *testing.T) {
 	messages := make(chan signaling.Envelope, 2)
+	payload, _, privateKey := keyedAgentOfferPayloadForTest(t, "agent-b", "payload.bin", 99)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 		conn, err := upgrader.Upgrade(w, req, nil)
@@ -647,7 +761,6 @@ func TestBackendLoopRunReceiverIgnoresBadStateMessageAndContinues(t *testing.T) 
 		if err := conn.WriteJSON(signaling.Envelope{Type: signaling.MessageTransferAccepted, TransferID: "tr_missing", FromAgentID: "agent-a", ToAgentID: "agent-b"}); err != nil {
 			t.Fatalf("write bad accepted: %v", err)
 		}
-		payload := json.RawMessage(`{"file_name":"payload.bin","file_size_bytes":99}`)
 		if err := conn.WriteJSON(signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: "tr_offer", FromAgentID: "agent-a", ToAgentID: "agent-b", Payload: payload}); err != nil {
 			t.Fatalf("write offer: %v", err)
 		}
@@ -662,7 +775,7 @@ func TestBackendLoopRunReceiverIgnoresBadStateMessageAndContinues(t *testing.T) 
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-b", Jobs: NewJobManager(nil), Inbox: NewInbox(t.TempDir(), nil), Client: NewBackendClient(server.URL, server.Client()), AgentAuthToken: "token-b"})
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-b", Jobs: NewJobManager(nil), Inbox: NewInbox(t.TempDir(), nil), Client: NewBackendClient(server.URL, server.Client()), AgentAuthToken: "token-b", AgentPrivateKey: privateKey})
 	runErr := make(chan error, 1)
 	go func() { runErr <- loop.RunReceiver(ctx) }()
 
@@ -746,6 +859,24 @@ func assertJSONDoesNotExposeTransferKey(t *testing.T, payload []byte, key p2p.Tr
 	if bytes.Contains(payload, secret) || bytes.Contains(payload, []byte(hex.EncodeToString(secret))) || bytes.Contains(payload, []byte(base64.StdEncoding.EncodeToString(secret))) || bytes.Contains(payload, []byte(base64.RawURLEncoding.EncodeToString(secret))) {
 		t.Fatalf("payload exposes raw transfer key: %s", payload)
 	}
+}
+
+func keyedAgentOfferPayloadForTest(t *testing.T, recipientAgentID string, fileName string, fileSize int64) ([]byte, p2p.TransferKey, []byte) {
+	t.Helper()
+	transferKey := mustAgentdTestTransferKey(t)
+	recipientPrivate, recipientPublic, err := p2p.GenerateAgentEnvelopeKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateAgentEnvelopeKeyPair: %v", err)
+	}
+	envelope, err := p2p.WrapTransferKeyForAgent(recipientAgentID, recipientPublic, transferKey)
+	if err != nil {
+		t.Fatalf("WrapTransferKeyForAgent: %v", err)
+	}
+	payload, err := json.Marshal(transferOfferPayload{FileName: fileName, FileSizeBytes: fileSize, KeyEnvelope: &envelope})
+	if err != nil {
+		t.Fatalf("marshal transfer offer payload: %v", err)
+	}
+	return payload, transferKey, recipientPrivate
 }
 
 func writeJSONForTest(w http.ResponseWriter, status int, payload any) {

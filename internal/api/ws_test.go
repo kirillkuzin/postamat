@@ -229,10 +229,10 @@ func TestAgentWebSocketReceivesRoutedOffer(t *testing.T) {
 	created := createWSTransfer(t, service, sessions.TargetAgent)
 	presence := signaling.NewPresenceRegistry(nil)
 	rooms := signaling.NewRoomManager(presence, nil)
-	server := httptest.NewServer(api.NewRouterWithSignaling(service, presence, rooms))
+	server := httptest.NewServer(api.NewRouterWithSignalingAndAgentAuth(service, presence, rooms, testAgentAuth(t, map[string]string{"agent_b": "token-b"})))
 	defer server.Close()
 
-	conn := dialWS(t, agentWSURL(server.URL, created))
+	conn := dialAuthenticatedAgentWS(t, server.URL, "agent_b", "token-b")
 	defer conn.Close()
 	writeEnvelope(t, conn, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "agent_b", DeviceID: "dev_b"})
 	readEnvelope(t, conn)
@@ -254,13 +254,13 @@ func TestAgentWebSocketReceivesRoutedOffer(t *testing.T) {
 	}
 }
 
-func TestAgentWebSocketRoutesWebRTCOfferBetweenTicketScopedAgentSockets(t *testing.T) {
+func TestAgentWebSocketRoutesWebRTCOfferFromTicketScopedSenderToAlwaysOnAgent(t *testing.T) {
 	service := secureTestService()
 	created := createWSTransfer(t, service, sessions.TargetAgent)
-	server := httptest.NewServer(api.NewRouterWithSignaling(service, signaling.NewPresenceRegistry(nil), nil))
+	server := httptest.NewServer(api.NewRouterWithSignalingAndAgentAuth(service, signaling.NewPresenceRegistry(nil), nil, testAgentAuth(t, map[string]string{"agent_b": "token-b"})))
 	defer server.Close()
 
-	receiver := dialWS(t, agentWSURL(server.URL, created))
+	receiver := dialAuthenticatedAgentWS(t, server.URL, "agent_b", "token-b")
 	defer receiver.Close()
 	writeEnvelope(t, receiver, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "agent_b", DeviceID: "dev_b"})
 	readEnvelope(t, receiver)
