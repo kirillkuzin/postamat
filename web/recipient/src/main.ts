@@ -60,6 +60,7 @@ type BrowserReceiveState = {
   nextSeq: number
   hasherReady: boolean
   pendingICE: RTCIceCandidateInit[]
+  messageQueue: Promise<void>
   completed: boolean
 }
 
@@ -333,7 +334,7 @@ async function prepareBrowserReceive(transfer: PublicTransfer, browserAgentID: s
   if (receiveState?.transfer.transfer_id === transfer.transfer_id) return
   const rawKey = readBrowserTransferKey()
   const key = await crypto.subtle.importKey('raw', rawKey, 'AES-GCM', false, ['decrypt'])
-  receiveState = { transfer, browserAgentID, key, chunks: [], totalBytes: 0, nextSeq: 0, hasherReady: true, pendingICE: [], completed: false }
+  receiveState = { transfer, browserAgentID, key, chunks: [], totalBytes: 0, nextSeq: 0, hasherReady: true, pendingICE: [], messageQueue: Promise.resolve(), completed: false }
   setStatus('Browser receiver key loaded; waiting for WebRTC offer.')
 }
 
@@ -362,7 +363,8 @@ async function acceptWebRTCOffer(ws: WebSocket, transfer: PublicTransfer, browse
       logEvent(`Data channel ${state.channel?.label ?? ''} opened.`)
     }
     state.channel.onmessage = (message) => {
-      void handleDataChannelMessage(ws, state, message.data)
+      const payload = message.data
+      state.messageQueue = state.messageQueue.then(() => handleDataChannelMessage(ws, state, payload))
     }
     state.channel.onerror = () => {
       if (state.completed) return
@@ -441,7 +443,9 @@ async function acceptBrowserChunk(ws: WebSocket, state: BrowserReceiveState, fra
 }
 
 async function completeBrowserReceive(ws: WebSocket, state: BrowserReceiveState, frame: ManifestFrame) {
-  if (frame.total_bytes !== state.totalBytes || frame.chunk_count !== state.nextSeq) throw new Error('Manifest size/count mismatch.')
+  if (frame.total_bytes !== state.totalBytes || frame.chunk_count !== state.nextSeq) {
+    throw new Error(`Manifest size/count mismatch: received ${state.totalBytes} B/${state.nextSeq} chunks, manifest ${frame.total_bytes} B/${frame.chunk_count} chunks.`)
+  }
   const received = concatChunks(state.chunks, state.totalBytes)
   const digest = bytesToHex(new Uint8Array(await crypto.subtle.digest('SHA-256', received)))
   if (digest !== frame.sha256) throw new Error('Manifest SHA-256 mismatch.')
