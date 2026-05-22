@@ -1,7 +1,10 @@
 package agentd
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -12,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/kirillkuzin/postamat/internal/p2p"
 	"github.com/kirillkuzin/postamat/internal/sessions"
 	"github.com/kirillkuzin/postamat/internal/signaling"
 )
@@ -320,6 +324,130 @@ func TestBackendLoopDeniesOfferByReceivePolicyBeforeInboxReservation(t *testing.
 	}
 }
 
+func TestBackendLoopOfferIncludesWrappedTransferKeyOnly(t *testing.T) {
+	transferKey := mustAgentdTestTransferKey(t)
+	_, recipientPublic, err := p2p.GenerateAgentEnvelopeKeyPair()
+	if err != nil {
+		t.Fatalf("generate recipient key pair: %v", err)
+	}
+	messages := make(chan signaling.Envelope, 2)
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		conn, err := upgrader.Upgrade(w, req, nil)
+		if err != nil {
+			t.Fatalf("upgrade: %v", err)
+		}
+		defer conn.Close()
+		for i := 0; i < 2; i++ {
+			var envelope signaling.Envelope
+			if err := conn.ReadJSON(&envelope); err != nil {
+				t.Fatalf("read json: %v", err)
+			}
+			messages <- envelope
+		}
+	}))
+	defer server.Close()
+
+	manager := NewJobManager(nil)
+	loop := NewBackendLoop(BackendLoopOptions{
+		AgentID:             "agent-a",
+		DeviceID:            "dev-1",
+		Jobs:                manager,
+		Client:              NewBackendClient(server.URL, server.Client()),
+		RecipientPublicKeys: map[string][]byte{"agent-b": recipientPublic},
+		GenerateTransferKey: func() (p2p.TransferKey, error) { return transferKey, nil },
+	})
+	job, err := manager.CreateSendJob(CreateSendJobInput{SourcePath: "/tmp/report.pdf", ToAgentID: "agent-b", FileName: "report.pdf", FileSizeBytes: 42})
+	if err != nil {
+		t.Fatalf("CreateSendJob returned error: %v", err)
+	}
+	job, err = manager.AttachTransfer(job.ID, "tr_key", "ticket-key")
+	if err != nil {
+		t.Fatalf("AttachTransfer returned error: %v", err)
+	}
+	job, err = manager.AttachTransferKey(job.ID, transferKey)
+	if err != nil {
+		t.Fatalf("AttachTransferKey returned error: %v", err)
+	}
+	job, err = manager.MarkOffered(job.ID)
+	if err != nil {
+		t.Fatalf("MarkOffered returned error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- loop.RunTransfer(ctx, job) }()
+	defer func() {
+		cancel()
+		select {
+		case <-runErr:
+		case <-time.After(2 * time.Second):
+			t.Fatal("RunTransfer did not stop after cancellation")
+		}
+	}()
+
+	readSignalingMessage(t, messages, "hello")
+	offer := readSignalingMessage(t, messages, "offer")
+	if offer.Type != signaling.MessageTransferOffer {
+		t.Fatalf("expected transfer offer, got %+v", offer)
+	}
+	if len(offer.Payload) == 0 {
+		t.Fatalf("offer payload missing key envelope")
+	}
+	assertJSONDoesNotExposeTransferKey(t, offer.Payload, transferKey)
+	var payload transferOfferPayload
+	if err := json.Unmarshal(offer.Payload, &payload); err != nil {
+		t.Fatalf("decode offer payload: %v", err)
+	}
+	if payload.KeyEnvelope == nil {
+		t.Fatalf("offer payload missing key envelope: %s", offer.Payload)
+	}
+}
+
+func TestBackendLoopOpensOfferKeyBeforeInboxReservation(t *testing.T) {
+	transferKey := mustAgentdTestTransferKey(t)
+	recipientPrivate, recipientPublic, err := p2p.GenerateAgentEnvelopeKeyPair()
+	if err != nil {
+		t.Fatalf("generate recipient key pair: %v", err)
+	}
+	envelope, err := p2p.WrapTransferKeyForAgent("agent-b", recipientPublic, transferKey)
+	if err != nil {
+		t.Fatalf("wrap key: %v", err)
+	}
+	payload, err := json.Marshal(transferOfferPayload{FileName: "payload.bin", FileSizeBytes: 99, KeyEnvelope: &envelope})
+	if err != nil {
+		t.Fatalf("marshal offer payload: %v", err)
+	}
+
+	manager := NewJobManager(nil)
+	inbox := NewInbox(t.TempDir(), nil)
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-1", Jobs: manager, Inbox: inbox, Client: NewBackendClient("https://postamat.example", nil), AgentPrivateKey: recipientPrivate})
+	if err := loop.HandleEnvelope(context.Background(), signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: "tr_key", FromAgentID: "agent-a", ToAgentID: "agent-b", Payload: payload}); err != nil {
+		t.Fatalf("HandleEnvelope returned error: %v", err)
+	}
+	job, ok := manager.FindByTransferID("tr_key")
+	if !ok {
+		t.Fatal("expected receive job")
+	}
+	if !job.HasTransferKey || job.TransferKey != transferKey {
+		t.Fatalf("receive job did not keep unwrapped transfer key")
+	}
+
+	deniedManager := NewJobManager(nil)
+	deniedInbox := NewInbox(t.TempDir(), nil)
+	deniedLoop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-1", Jobs: deniedManager, Inbox: deniedInbox, Client: NewBackendClient("https://postamat.example", nil)})
+	if err := deniedLoop.HandleEnvelope(context.Background(), signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: "tr_no_key", FromAgentID: "agent-a", ToAgentID: "agent-b", Payload: payload}); !errors.Is(err, ErrTransferKeyRequired) {
+		t.Fatalf("HandleEnvelope without private key error = %v, want ErrTransferKeyRequired", err)
+	}
+	if _, ok := deniedManager.FindByTransferID("tr_no_key"); ok {
+		t.Fatal("invalid key offer created a receive job")
+	}
+	if entries := deniedInbox.List(); len(entries) != 0 {
+		t.Fatalf("invalid key offer reserved inbox entries: %+v", entries)
+	}
+}
+
 func TestBackendLoopWritesAcceptedOrDeniedDecisionOverWebSocket(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -389,6 +517,23 @@ func TestBackendLoopWritesAcceptedOrDeniedDecisionOverWebSocket(t *testing.T) {
 				t.Fatal("RunTransfer did not stop after context cancellation")
 			}
 		})
+	}
+}
+
+func mustAgentdTestTransferKey(t *testing.T) p2p.TransferKey {
+	t.Helper()
+	key, err := p2p.TransferKeyFromBytes(bytes.Repeat([]byte{0x42}, p2p.TransferKeySize))
+	if err != nil {
+		t.Fatalf("transfer key: %v", err)
+	}
+	return key
+}
+
+func assertJSONDoesNotExposeTransferKey(t *testing.T, payload []byte, key p2p.TransferKey) {
+	t.Helper()
+	secret := key.Bytes()
+	if bytes.Contains(payload, secret) || bytes.Contains(payload, []byte(hex.EncodeToString(secret))) || bytes.Contains(payload, []byte(base64.StdEncoding.EncodeToString(secret))) || bytes.Contains(payload, []byte(base64.RawURLEncoding.EncodeToString(secret))) {
+		t.Fatalf("payload exposes raw transfer key: %s", payload)
 	}
 }
 

@@ -117,6 +117,76 @@ func TestLocalAPICreateDelegatesToBackendLoopWhenConfigured(t *testing.T) {
 	}
 }
 
+func TestLocalAPICancelPropagatesToBackendWhenConfigured(t *testing.T) {
+	cancelled := make(chan string, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodDelete && req.URL.Path == "/api/v1/transfers/tr_cancel" {
+			cancelled <- "tr_cancel"
+			writeJSONForTest(w, http.StatusOK, map[string]any{"transfer_id": "tr_cancel", "status": "cancelled"})
+			return
+		}
+		t.Fatalf("unexpected backend request %s %s", req.Method, req.URL.Path)
+	}))
+	defer backend.Close()
+
+	manager := NewJobManager(nil)
+	job, err := manager.CreateSendJob(CreateSendJobInput{SourcePath: "/tmp/report.pdf", ToAgentID: "agent-b", FileName: "report.pdf", FileSizeBytes: 42})
+	if err != nil {
+		t.Fatalf("CreateSendJob returned error: %v", err)
+	}
+	if _, err := manager.AttachTransfer(job.ID, "tr_cancel", "ticket"); err != nil {
+		t.Fatalf("AttachTransfer returned error: %v", err)
+	}
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-a", DeviceID: "dev-1", Jobs: manager, Client: NewBackendClient(backend.URL, backend.Client())})
+	handler := NewLocalRouterWithBackend(manager, loop)
+
+	cancelRec := httptest.NewRecorder()
+	handler.ServeHTTP(cancelRec, httptest.NewRequest(http.MethodPost, "/local/v1/transfers/tr_cancel/cancel", nil))
+	if cancelRec.Code != http.StatusOK {
+		t.Fatalf("cancel status = %d, body = %s", cancelRec.Code, cancelRec.Body.String())
+	}
+	select {
+	case got := <-cancelled:
+		if got != "tr_cancel" {
+			t.Fatalf("backend cancelled %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("backend cancel was not called")
+	}
+}
+
+func TestLocalAPICancelDoesNotCallBackendForTerminalJob(t *testing.T) {
+	called := false
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		called = true
+		t.Fatalf("backend should not be called for terminal local job: %s %s", req.Method, req.URL.Path)
+	}))
+	defer backend.Close()
+
+	manager := NewJobManager(nil)
+	job, err := manager.CreateSendJob(CreateSendJobInput{SourcePath: "/tmp/report.pdf", ToAgentID: "agent-b", FileName: "report.pdf", FileSizeBytes: 42})
+	if err != nil {
+		t.Fatalf("CreateSendJob returned error: %v", err)
+	}
+	if _, err := manager.AttachTransfer(job.ID, "tr_terminal", "ticket"); err != nil {
+		t.Fatalf("AttachTransfer returned error: %v", err)
+	}
+	if _, err := manager.Cancel(job.ID); err != nil {
+		t.Fatalf("Cancel returned error: %v", err)
+	}
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-a", DeviceID: "dev-1", Jobs: manager, Client: NewBackendClient(backend.URL, backend.Client())})
+	handler := NewLocalRouterWithBackend(manager, loop)
+
+	cancelRec := httptest.NewRecorder()
+	handler.ServeHTTP(cancelRec, httptest.NewRequest(http.MethodPost, "/local/v1/transfers/tr_terminal/cancel", nil))
+	if cancelRec.Code != http.StatusBadRequest {
+		t.Fatalf("terminal cancel status = %d, body = %s", cancelRec.Code, cancelRec.Body.String())
+	}
+	if called {
+		t.Fatal("backend cancel called for terminal local job")
+	}
+}
+
 func readSignalingMessage(t *testing.T, messages <-chan signaling.Envelope, label string) signaling.Envelope {
 	t.Helper()
 	select {

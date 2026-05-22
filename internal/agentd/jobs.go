@@ -7,6 +7,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/kirillkuzin/postamat/internal/p2p"
 )
 
 type JobDirection string
@@ -51,25 +53,27 @@ var (
 )
 
 type Job struct {
-	ID              string       `json:"id"`
-	Direction       JobDirection `json:"direction"`
-	Status          JobStatus    `json:"status"`
-	TransferID      string       `json:"transfer_id,omitempty"`
-	AgentTicket     string       `json:"-"`
-	SourcePath      string       `json:"source_path,omitempty"`
-	DestinationPath string       `json:"destination_path,omitempty"`
-	FromAgentID     string       `json:"from_agent_id,omitempty"`
-	ToAgentID       string       `json:"to_agent_id,omitempty"`
-	BrowserLink     bool         `json:"browser_link,omitempty"`
-	FileName        string       `json:"file_name"`
-	FileSizeBytes   int64        `json:"file_size_bytes"`
-	ProgressBytes   int64        `json:"progress_bytes"`
-	FailureReason   string       `json:"failure_reason,omitempty"`
-	CreatedAt       time.Time    `json:"created_at"`
-	UpdatedAt       time.Time    `json:"updated_at"`
-	CompletedAt     *time.Time   `json:"completed_at,omitempty"`
-	FailedAt        *time.Time   `json:"failed_at,omitempty"`
-	CancelledAt     *time.Time   `json:"cancelled_at,omitempty"`
+	ID              string          `json:"id"`
+	Direction       JobDirection    `json:"direction"`
+	Status          JobStatus       `json:"status"`
+	TransferID      string          `json:"transfer_id,omitempty"`
+	AgentTicket     string          `json:"-"`
+	TransferKey     p2p.TransferKey `json:"-"`
+	HasTransferKey  bool            `json:"-"`
+	SourcePath      string          `json:"source_path,omitempty"`
+	DestinationPath string          `json:"destination_path,omitempty"`
+	FromAgentID     string          `json:"from_agent_id,omitempty"`
+	ToAgentID       string          `json:"to_agent_id,omitempty"`
+	BrowserLink     bool            `json:"browser_link,omitempty"`
+	FileName        string          `json:"file_name"`
+	FileSizeBytes   int64           `json:"file_size_bytes"`
+	ProgressBytes   int64           `json:"progress_bytes"`
+	FailureReason   string          `json:"failure_reason,omitempty"`
+	CreatedAt       time.Time       `json:"created_at"`
+	UpdatedAt       time.Time       `json:"updated_at"`
+	CompletedAt     *time.Time      `json:"completed_at,omitempty"`
+	FailedAt        *time.Time      `json:"failed_at,omitempty"`
+	CancelledAt     *time.Time      `json:"cancelled_at,omitempty"`
 	sequence        int64
 }
 
@@ -183,6 +187,21 @@ func (m *JobManager) AttachTransfer(jobID string, transferID string, agentTicket
 		job.UpdatedAt = now
 		return nil
 	}, JobEvent{Type: JobEventTransferBound, TransferID: transferID})
+}
+
+func (m *JobManager) AttachTransferKey(jobID string, key p2p.TransferKey) (Job, error) {
+	if key == (p2p.TransferKey{}) {
+		return Job{}, ErrTransferKeyRequired
+	}
+	return m.update(jobID, func(job *Job, now time.Time) error {
+		if job.isTerminal() {
+			return ErrJobTerminal
+		}
+		job.TransferKey = key
+		job.HasTransferKey = true
+		job.UpdatedAt = now
+		return nil
+	}, JobEvent{Type: JobEventTransferBound})
 }
 
 func (m *JobManager) MarkOffered(jobID string) (Job, error) {

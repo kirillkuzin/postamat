@@ -37,11 +37,11 @@ func TestAgentWebSocketRegistersPresenceAfterValidatedHello(t *testing.T) {
 	}
 }
 
-func TestAgentWebSocketRejectsMissingTicket(t *testing.T) {
+func TestAgentWebSocketRejectsPartialTransferScopedTicket(t *testing.T) {
 	server := httptest.NewServer(newTestRouter())
 	defer server.Close()
 
-	_, response, err := websocket.DefaultDialer.Dial(wsURL(server.URL+"/api/v1/agent/ws"), nil)
+	_, response, err := websocket.DefaultDialer.Dial(wsURL(server.URL+"/api/v1/agent/ws?transfer_id=tr_missing_ticket"), nil)
 	if err == nil {
 		t.Fatalf("expected websocket dial to fail without ticket")
 	}
@@ -158,6 +158,29 @@ func TestAgentWebSocketReceivesRoutedOffer(t *testing.T) {
 	}
 	if got.Type != signaling.MessageTransferOffer || got.TransferID != created.Transfer.ID {
 		t.Fatalf("unexpected routed envelope: %+v", got)
+	}
+}
+
+func TestAgentWebSocketRoutesWebRTCOfferBetweenTicketScopedAgentSockets(t *testing.T) {
+	service := secureTestService()
+	created := createWSTransfer(t, service, sessions.TargetAgent)
+	server := httptest.NewServer(api.NewRouterWithSignaling(service, signaling.NewPresenceRegistry(nil), nil))
+	defer server.Close()
+
+	receiver := dialWS(t, agentWSURL(server.URL, created))
+	defer receiver.Close()
+	writeEnvelope(t, receiver, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "agent_b", DeviceID: "dev_b"})
+	readEnvelope(t, receiver)
+
+	sender := dialWS(t, agentWSURL(server.URL, created))
+	defer sender.Close()
+	writeEnvelope(t, sender, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "agent_a", DeviceID: "dev_a"})
+	readEnvelope(t, sender)
+	writeEnvelope(t, sender, signaling.Envelope{Type: signaling.MessageWebRTCOffer, TransferID: created.Transfer.ID, FromAgentID: "agent_a", ToAgentID: "agent_b", Payload: json.RawMessage(`{"sdp":{"type":"offer","sdp":"v=0\\r\\n"}}`)})
+
+	got := readEnvelope(t, receiver)
+	if got.Type != signaling.MessageWebRTCOffer || got.TransferID != created.Transfer.ID || got.FromAgentID != "agent_a" || got.ToAgentID != "agent_b" {
+		t.Fatalf("receiver got unexpected routed WebRTC offer: %+v", got)
 	}
 }
 
