@@ -3,6 +3,8 @@ package p2p
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"testing"
@@ -151,6 +153,76 @@ func TestReceiverExportsAckAndResumeManifestAfterAcceptedChunks(t *testing.T) {
 	if resume.TransferID != "tr_123" || resume.NextSequence != 2 || resume.NextOffset != 10 || resume.TotalBytes != 11 || resume.SHA256Hex == "" {
 		t.Fatalf("receiver resume manifest = %#v", resume)
 	}
+}
+
+func TestStreamReaderResumeReplaysFromManifestOffsetAndSequence(t *testing.T) {
+	payload := []byte("hello world")
+	prefix := payload[:6]
+	resume := resumeManifestForPrefix("tr_resume", prefix, 2, int64(len(payload)))
+	dc := newFakeDataChannel()
+
+	manifest, err := StreamReader(context.Background(), "tr_resume", bytes.NewReader(payload), dc, SenderOptions{ChunkSize: 3, AllowPlaintext: true, Resume: &resume})
+	if err != nil {
+		t.Fatalf("resumed stream reader: %v", err)
+	}
+	first, err := DecodeFrame(dc.sent[0])
+	if err != nil {
+		t.Fatalf("decode first resumed frame: %v", err)
+	}
+	if first.Type != FrameTypeChunk || first.Sequence != 2 || first.Offset != int64(len(prefix)) || string(first.Data) != "wor" {
+		t.Fatalf("first resumed frame = %#v", first)
+	}
+	if manifest.TotalBytes != int64(len(payload)) || manifest.ChunkCount != 4 {
+		t.Fatalf("resumed manifest = %#v", manifest)
+	}
+
+	var suffix bytes.Buffer
+	receiver, err := NewReceiverFromResume("tr_resume", &suffix, bytes.NewReader(prefix), resume, ReceiverOptions{AllowPlaintext: true})
+	if err != nil {
+		t.Fatalf("NewReceiverFromResume: %v", err)
+	}
+	var completed *Manifest
+	for _, msg := range dc.sent {
+		completed, err = receiver.Accept(msg)
+		if err != nil {
+			t.Fatalf("receiver accept resumed frame: %v", err)
+		}
+	}
+	if completed == nil || *completed != manifest {
+		t.Fatalf("completed resumed manifest = %#v, want %#v", completed, manifest)
+	}
+	if suffix.String() != "world" {
+		t.Fatalf("receiver wrote suffix %q", suffix.String())
+	}
+}
+
+func TestResumeRejectsMismatchedDurablePrefixDigest(t *testing.T) {
+	payload := []byte("hello world")
+	resume := resumeManifestForPrefix("tr_resume", payload[:6], 2, int64(len(payload)))
+	resume.SHA256Hex = "0000000000000000000000000000000000000000000000000000000000000000"
+
+	if _, err := StreamReader(context.Background(), "tr_resume", bytes.NewReader(payload), newFakeDataChannel(), SenderOptions{ChunkSize: 3, AllowPlaintext: true, Resume: &resume}); !errors.Is(err, ErrResumeDigestMismatch) {
+		t.Fatalf("StreamReader resume error = %v, want ErrResumeDigestMismatch", err)
+	}
+	if _, err := NewReceiverFromResume("tr_resume", io.Discard, bytes.NewReader(payload[:6]), resume, ReceiverOptions{AllowPlaintext: true}); !errors.Is(err, ErrResumeDigestMismatch) {
+		t.Fatalf("NewReceiverFromResume error = %v, want ErrResumeDigestMismatch", err)
+	}
+}
+
+func TestResumeRejectsWrongTransferIDAndPastTotalOffset(t *testing.T) {
+	resume := resumeManifestForPrefix("tr_resume", []byte("hello"), 1, 5)
+	if _, err := StreamReader(context.Background(), "tr_other", bytes.NewReader([]byte("hello")), newFakeDataChannel(), SenderOptions{AllowPlaintext: true, Resume: &resume}); !errors.Is(err, ErrUnexpectedTransferID) {
+		t.Fatalf("StreamReader wrong transfer error = %v, want ErrUnexpectedTransferID", err)
+	}
+	resume.NextOffset = 6
+	if _, err := NewReceiverFromResume("tr_resume", io.Discard, bytes.NewReader([]byte("hello")), resume, ReceiverOptions{AllowPlaintext: true}); !errors.Is(err, ErrResumePastTotalBytes) {
+		t.Fatalf("NewReceiverFromResume past total error = %v, want ErrResumePastTotalBytes", err)
+	}
+}
+
+func resumeManifestForPrefix(transferID string, prefix []byte, nextSequence uint64, totalBytes int64) ResumeManifest {
+	digest := sha256.Sum256(prefix)
+	return ResumeManifest{TransferID: transferID, NextSequence: nextSequence, NextOffset: int64(len(prefix)), TotalBytes: totalBytes, SHA256Hex: hex.EncodeToString(digest[:])}
 }
 
 func TestStreamReaderSendsChunksManifestAndProgress(t *testing.T) {

@@ -34,6 +34,7 @@ var (
 	ErrUnexpectedSequence         = errors.New("unexpected chunk sequence")
 	ErrUnexpectedOffset           = errors.New("unexpected chunk offset")
 	ErrManifestMismatch           = errors.New("manifest does not match received bytes")
+	ErrResumeDigestMismatch       = errors.New("resume prefix digest does not match durable bytes")
 	ErrTransferComplete           = errors.New("transfer is already complete")
 	ErrTransferFailed             = errors.New("transfer failed")
 )
