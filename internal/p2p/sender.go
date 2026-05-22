@@ -29,6 +29,7 @@ type SenderOptions struct {
 	OnProgress        func(Progress)
 	Encryption        *ChunkCipher
 	AllowPlaintext    bool
+	Resume            *ResumeManifest
 }
 
 func StreamReader(ctx context.Context, transferID string, source io.Reader, channel OutboundDataChannel, options SenderOptions) (Manifest, error) {
@@ -49,10 +50,17 @@ func StreamReader(ctx context.Context, transferID string, source io.Reader, chan
 	hash := sha256.New()
 	var total int64
 	var sequence uint64
+	if options.Resume != nil {
+		if err := prepareSenderResume(source, transferID, options.Resume, hash); err != nil {
+			return Manifest{}, err
+		}
+		total = options.Resume.NextOffset
+		sequence = options.Resume.NextSequence
+	}
 
 	for {
 		if err := ctx.Err(); err != nil {
-			return Manifest{}, fmt.Errorf("%w: %v", ErrTransferFailed, err)
+			return Manifest{}, fmt.Errorf("%w: %w", ErrTransferFailed, err)
 		}
 		n, readErr := source.Read(buffer)
 		if n > 0 {
@@ -84,6 +92,9 @@ func StreamReader(ctx context.Context, transferID string, source io.Reader, chan
 	}
 
 	manifest := Manifest{TransferID: transferID, TotalBytes: total, ChunkCount: sequence, SHA256Hex: hex.EncodeToString(hash.Sum(nil))}
+	if options.Resume != nil && options.Resume.TotalBytes != total {
+		return Manifest{}, ErrManifestMismatch
+	}
 	encoded, err := EncodeManifestFrame(manifest)
 	if err != nil {
 		return Manifest{}, err
@@ -92,6 +103,41 @@ func StreamReader(ctx context.Context, transferID string, source io.Reader, chan
 		return Manifest{}, fmt.Errorf("%w: %v", ErrTransferFailed, err)
 	}
 	return manifest, nil
+}
+
+func prepareSenderResume(source io.Reader, transferID string, resume *ResumeManifest, digest io.Writer) error {
+	if resume == nil {
+		return nil
+	}
+	if resume.TransferID != transferID {
+		return ErrUnexpectedTransferID
+	}
+	if resume.NextOffset < 0 || resume.NextOffset > resume.TotalBytes {
+		return ErrResumePastTotalBytes
+	}
+	if seeker, ok := source.(io.Seeker); ok {
+		if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("%w: %v", ErrTransferFailed, err)
+		}
+	}
+	copied, err := io.CopyN(digest, source, resume.NextOffset)
+	if err != nil && err != io.EOF {
+		return fmt.Errorf("%w: %v", ErrTransferFailed, err)
+	}
+	if copied != resume.NextOffset {
+		return ErrUnexpectedOffset
+	}
+	if hexDigest, ok := digest.(interface{ Sum([]byte) []byte }); ok {
+		if hex.EncodeToString(hexDigest.Sum(nil)) != resume.SHA256Hex {
+			return ErrResumeDigestMismatch
+		}
+	}
+	if seeker, ok := source.(io.Seeker); ok {
+		if _, err := seeker.Seek(resume.NextOffset, io.SeekStart); err != nil {
+			return fmt.Errorf("%w: %v", ErrTransferFailed, err)
+		}
+	}
+	return nil
 }
 
 func sendChunk(ctx context.Context, transferID string, channel OutboundDataChannel, options SenderOptions, digest io.Writer, sequence uint64, offset int64, plaintext []byte) error {
@@ -111,7 +157,7 @@ func sendChunk(ctx context.Context, transferID string, channel OutboundDataChann
 		return err
 	}
 	if err := waitForBackpressure(ctx, channel, options.MaxBufferedAmount); err != nil {
-		return fmt.Errorf("%w: %v", ErrTransferFailed, err)
+		return fmt.Errorf("%w: %w", ErrTransferFailed, err)
 	}
 	if err := channel.Send(encoded); err != nil {
 		return fmt.Errorf("%w: %v", ErrTransferFailed, err)

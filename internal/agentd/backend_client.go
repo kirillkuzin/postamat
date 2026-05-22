@@ -1052,6 +1052,13 @@ func (l *BackendLoop) runLiveReceiverOnce(ctx context.Context, send func(signali
 		_ = sendTransferState(send, signaling.MessageTransferFailed, job.TransferID, l.agentID, job.FromAgentID, nil)
 		return err
 	}
+	partialInfo, err := destination.Stat()
+	if err != nil {
+		_ = destination.Close()
+		_ = l.failTransferJob(job.TransferID, err.Error())
+		_ = sendTransferState(send, signaling.MessageTransferFailed, job.TransferID, l.agentID, job.FromAgentID, nil)
+		return err
+	}
 	partialCommitted := false
 	defer func() {
 		_ = destination.Close()
@@ -1104,7 +1111,7 @@ func (l *BackendLoop) runLiveReceiverOnce(ctx context.Context, send func(signali
 			if err := destination.Close(); err != nil {
 				return err
 			}
-			if err := commitDestinationNoReplace(partialPath, job.DestinationPath); err != nil {
+			if err := commitDestinationNoReplace(partialPath, job.DestinationPath, partialInfo, *manifest); err != nil {
 				_ = l.failTransferJob(job.TransferID, err.Error())
 				_ = sendTransferState(send, signaling.MessageTransferFailed, job.TransferID, l.agentID, job.FromAgentID, nil)
 				return err

@@ -34,6 +34,32 @@ func NewReceiver(transferID string, destination io.Writer, options ReceiverOptio
 	return &Receiver{transferID: transferID, writer: destination, options: options, hash: sha256.New()}
 }
 
+func NewReceiverFromResume(transferID string, destination io.Writer, durablePrefix io.Reader, resume ResumeManifest, options ReceiverOptions) (*Receiver, error) {
+	if transferID == "" || destination == nil || durablePrefix == nil {
+		return nil, fmt.Errorf("%w: missing receiver endpoint", ErrTransferFailed)
+	}
+	if resume.TransferID != transferID {
+		return nil, ErrUnexpectedTransferID
+	}
+	if resume.NextOffset < 0 || resume.NextOffset > resume.TotalBytes {
+		return nil, ErrResumePastTotalBytes
+	}
+	receiver := NewReceiver(transferID, destination, options)
+	copied, err := io.CopyN(receiver.hash, durablePrefix, resume.NextOffset)
+	if err != nil && err != io.EOF {
+		return nil, fmt.Errorf("%w: %v", ErrTransferFailed, err)
+	}
+	if copied != resume.NextOffset {
+		return nil, ErrUnexpectedOffset
+	}
+	if hex.EncodeToString(receiver.hash.Sum(nil)) != resume.SHA256Hex {
+		return nil, ErrResumeDigestMismatch
+	}
+	receiver.nextSeq = resume.NextSequence
+	receiver.offset = resume.NextOffset
+	return receiver, nil
+}
+
 func (r *Receiver) Ack() Ack {
 	if r == nil {
 		return Ack{}
