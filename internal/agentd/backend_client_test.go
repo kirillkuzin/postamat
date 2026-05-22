@@ -520,6 +520,217 @@ func TestBackendLoopWritesAcceptedOrDeniedDecisionOverWebSocket(t *testing.T) {
 	}
 }
 
+func TestBackendClientBuildsAuthenticatedAgentPresenceWebSocketURL(t *testing.T) {
+	client := NewBackendClient("https://postamat.example/base", nil)
+	url, err := client.AgentPresenceWebSocketURL("agent b")
+	if err != nil {
+		t.Fatalf("AgentPresenceWebSocketURL returned error: %v", err)
+	}
+	if url != "wss://postamat.example/base/api/v1/agents/ws?agent_id=agent+b" {
+		t.Fatalf("url = %q", url)
+	}
+}
+
+func TestBackendLoopRunReceiverSendsHelloOnAlwaysOnSocket(t *testing.T) {
+	messages := make(chan signaling.Envelope, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/api/v1/agents/ws" || req.URL.Query().Get("agent_id") != "agent-b" {
+			t.Fatalf("unexpected websocket request: %s", req.URL.String())
+		}
+		if req.Header.Get("Authorization") != "Bearer token-b" {
+			t.Fatalf("missing bearer token: %q", req.Header.Get("Authorization"))
+		}
+		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+		conn, err := upgrader.Upgrade(w, req, nil)
+		if err != nil {
+			t.Fatalf("upgrade: %v", err)
+		}
+		defer conn.Close()
+		var hello signaling.Envelope
+		if err := conn.ReadJSON(&hello); err != nil {
+			t.Fatalf("read hello: %v", err)
+		}
+		messages <- hello
+		<-req.Context().Done()
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-b", Client: NewBackendClient(server.URL, server.Client()), AgentAuthToken: "token-b"})
+	runErr := make(chan error, 1)
+	go func() { runErr <- loop.RunReceiver(ctx) }()
+
+	hello := readSignalingMessage(t, messages, "hello")
+	if hello.Type != signaling.MessageAgentHello || hello.AgentID != "agent-b" || hello.DeviceID != "dev-b" || hello.TransferID != "" {
+		t.Fatalf("unexpected always-on hello: %+v", hello)
+	}
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("RunReceiver returned error after cancellation: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunReceiver did not stop after context cancellation")
+	}
+}
+
+func TestBackendLoopRunReceiverAcceptsOfferOverAlwaysOnSocket(t *testing.T) {
+	messages := make(chan signaling.Envelope, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+		conn, err := upgrader.Upgrade(w, req, nil)
+		if err != nil {
+			t.Fatalf("upgrade: %v", err)
+		}
+		defer conn.Close()
+		var hello signaling.Envelope
+		if err := conn.ReadJSON(&hello); err != nil {
+			t.Fatalf("read hello: %v", err)
+		}
+		messages <- hello
+		payload := json.RawMessage(`{"file_name":"payload.bin","file_size_bytes":99}`)
+		if err := conn.WriteJSON(signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: "tr_offer", FromAgentID: "agent-a", ToAgentID: "agent-b", Payload: payload}); err != nil {
+			t.Fatalf("write offer: %v", err)
+		}
+		var decision signaling.Envelope
+		if err := conn.ReadJSON(&decision); err != nil {
+			t.Fatalf("read decision: %v", err)
+		}
+		messages <- decision
+		<-req.Context().Done()
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager := NewJobManager(nil)
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-b", Jobs: manager, Inbox: NewInbox(t.TempDir(), nil), Client: NewBackendClient(server.URL, server.Client()), AgentAuthToken: "token-b"})
+	runErr := make(chan error, 1)
+	go func() { runErr <- loop.RunReceiver(ctx) }()
+
+	readSignalingMessage(t, messages, "hello")
+	decision := readSignalingMessage(t, messages, "decision")
+	if decision.Type != signaling.MessageTransferAccepted || decision.TransferID != "tr_offer" || decision.FromAgentID != "agent-b" || decision.ToAgentID != "agent-a" {
+		t.Fatalf("unexpected decision: %+v", decision)
+	}
+	job, ok := manager.FindByTransferID("tr_offer")
+	if !ok || job.Direction != JobDirectionReceive || job.Status != JobStatusAccepted || job.DestinationPath == "" {
+		t.Fatalf("expected accepted receive job with inbox destination, got %+v ok=%v", job, ok)
+	}
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("RunReceiver returned error after cancellation: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunReceiver did not stop after context cancellation")
+	}
+}
+
+func TestBackendLoopRunReceiverIgnoresBadStateMessageAndContinues(t *testing.T) {
+	messages := make(chan signaling.Envelope, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+		conn, err := upgrader.Upgrade(w, req, nil)
+		if err != nil {
+			t.Fatalf("upgrade: %v", err)
+		}
+		defer conn.Close()
+		var hello signaling.Envelope
+		if err := conn.ReadJSON(&hello); err != nil {
+			t.Fatalf("read hello: %v", err)
+		}
+		messages <- hello
+		if err := conn.WriteJSON(signaling.Envelope{Type: signaling.MessageTransferAccepted, TransferID: "tr_missing", FromAgentID: "agent-a", ToAgentID: "agent-b"}); err != nil {
+			t.Fatalf("write bad accepted: %v", err)
+		}
+		payload := json.RawMessage(`{"file_name":"payload.bin","file_size_bytes":99}`)
+		if err := conn.WriteJSON(signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: "tr_offer", FromAgentID: "agent-a", ToAgentID: "agent-b", Payload: payload}); err != nil {
+			t.Fatalf("write offer: %v", err)
+		}
+		var decision signaling.Envelope
+		if err := conn.ReadJSON(&decision); err != nil {
+			t.Fatalf("read decision: %v", err)
+		}
+		messages <- decision
+		<-req.Context().Done()
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-b", Jobs: NewJobManager(nil), Inbox: NewInbox(t.TempDir(), nil), Client: NewBackendClient(server.URL, server.Client()), AgentAuthToken: "token-b"})
+	runErr := make(chan error, 1)
+	go func() { runErr <- loop.RunReceiver(ctx) }()
+
+	readSignalingMessage(t, messages, "hello")
+	decision := readSignalingMessage(t, messages, "decision")
+	if decision.Type != signaling.MessageTransferAccepted || decision.TransferID != "tr_offer" {
+		t.Fatalf("receiver did not continue to accept later offer: %+v", decision)
+	}
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("RunReceiver returned error after cancellation: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunReceiver did not stop after context cancellation")
+	}
+}
+
+func TestBackendLoopRunReceiverReconnectsAfterDroppedAlwaysOnSocket(t *testing.T) {
+	hellos := make(chan signaling.Envelope, 2)
+	var mu sync.Mutex
+	connections := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+		conn, err := upgrader.Upgrade(w, req, nil)
+		if err != nil {
+			t.Fatalf("upgrade: %v", err)
+		}
+		defer conn.Close()
+		var hello signaling.Envelope
+		if err := conn.ReadJSON(&hello); err != nil {
+			t.Fatalf("read hello: %v", err)
+		}
+		hellos <- hello
+		mu.Lock()
+		connections++
+		current := connections
+		mu.Unlock()
+		if current == 1 {
+			return
+		}
+		<-req.Context().Done()
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-b", Client: NewBackendClient(server.URL, server.Client()), AgentAuthToken: "token-b"})
+	runErr := make(chan error, 1)
+	go func() { runErr <- loop.RunReceiver(ctx) }()
+
+	first := readSignalingMessage(t, hellos, "first hello")
+	second := readSignalingMessage(t, hellos, "reconnected hello")
+	if first.Type != signaling.MessageAgentHello || second.Type != signaling.MessageAgentHello {
+		t.Fatalf("unexpected reconnect hellos: first=%+v second=%+v", first, second)
+	}
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("RunReceiver returned error after cancellation: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunReceiver did not stop after context cancellation")
+	}
+}
+
 func mustAgentdTestTransferKey(t *testing.T) p2p.TransferKey {
 	t.Helper()
 	key, err := p2p.TransferKeyFromBytes(bytes.Repeat([]byte{0x42}, p2p.TransferKeySize))

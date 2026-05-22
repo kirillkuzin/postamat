@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -23,6 +24,7 @@ type websocketAuth struct {
 	DeviceID       string
 	TransferID     string
 	Browser        bool
+	AgentScoped    bool
 }
 
 func (p *websocketPeer) Send(envelope signaling.Envelope) error {
@@ -52,6 +54,37 @@ func (r *Router) handleAgentWebSocket(w http.ResponseWriter, req *http.Request) 
 		allowedTargets[browserRecipientAgentID(transfer.ID)] = struct{}{}
 	}
 	r.handleSignalingWebSocket(w, req, websocketAuth{AllowedAgents: allowedAgents, AllowedTargets: allowedTargets, TransferID: transfer.ID})
+}
+
+func (r *Router) handleAuthenticatedAgentWebSocket(w http.ResponseWriter, req *http.Request) {
+	agentID := req.URL.Query().Get("agent_id")
+	if agentID == "" {
+		writeError(w, http.StatusUnauthorized, "agent_id is required")
+		return
+	}
+	if r.agentAuth == nil {
+		writeError(w, http.StatusUnauthorized, "agent auth is not configured")
+		return
+	}
+	token, ok := bearerToken(req.Header.Get("Authorization"))
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "bearer token is required")
+		return
+	}
+	if err := r.agentAuth.VerifyAgentToken(req.Context(), agentID, token); err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid agent token")
+		return
+	}
+	r.handleSignalingWebSocket(w, req, websocketAuth{AgentID: agentID, AgentScoped: true})
+}
+
+func bearerToken(header string) (string, bool) {
+	const prefix = "Bearer "
+	if !strings.HasPrefix(header, prefix) {
+		return "", false
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(header, prefix))
+	return token, token != ""
 }
 
 func (r *Router) handleBrowserReceiverWebSocket(w http.ResponseWriter, req *http.Request) {
@@ -110,7 +143,11 @@ func (r *Router) handleSignalingWebSocket(w http.ResponseWriter, req *http.Reque
 	}
 	auth.AgentID = agentID
 	r.presence.Register(signaling.DevicePresence{AgentID: agentID, DeviceID: deviceID, Capabilities: []string{"webrtc_datachannel"}})
-	r.rooms.AttachTransferPeer(agentID, deviceID, auth.TransferID, peer)
+	if auth.AgentScoped {
+		r.rooms.AttachPeer(agentID, deviceID, peer)
+	} else {
+		r.rooms.AttachTransferPeer(agentID, deviceID, auth.TransferID, peer)
+	}
 	_ = peer.Send(signaling.Envelope{Type: signaling.MessageAgentPresence, AgentID: agentID, DeviceID: deviceID})
 	defer r.rooms.DetachPeer(agentID, deviceID, peer)
 
@@ -130,13 +167,13 @@ func (r *Router) handleSignalingWebSocket(w http.ResponseWriter, req *http.Reque
 			r.presence.Touch(agentID, deviceID)
 			continue
 		}
-		if envelope.TransferID == auth.TransferID {
-			if _, err := r.service.VerifyTransferUsable(req.Context(), auth.TransferID); err != nil {
+		if envelope.TransferID != "" {
+			if _, err := r.service.VerifyTransferUsable(req.Context(), envelope.TransferID); err != nil {
 				_ = peer.Send(errorEnvelope("transfer is no longer active"))
 				return
 			}
 		}
-		if err := authorizeOutboundEnvelope(auth, envelope); err != nil {
+		if err := r.authorizeOutboundEnvelope(req.Context(), auth, envelope); err != nil {
 			_ = peer.Send(errorEnvelope(err.Error()))
 			continue
 		}
@@ -146,17 +183,52 @@ func (r *Router) handleSignalingWebSocket(w http.ResponseWriter, req *http.Reque
 	}
 }
 
-func authorizeOutboundEnvelope(auth websocketAuth, envelope signaling.Envelope) error {
-	if envelope.TransferID != auth.TransferID {
-		return sessions.ErrSessionNotFound
-	}
+func (r *Router) authorizeOutboundEnvelope(ctx context.Context, auth websocketAuth, envelope signaling.Envelope) error {
 	if envelope.FromAgentID == "" || envelope.FromAgentID != auth.AgentID {
 		return signaling.ErrAgentIDRequired
 	}
-	if envelope.ToAgentID == "" || !auth.allowsTarget(envelope.ToAgentID) {
+	if envelope.ToAgentID == "" {
 		return signaling.ErrRouteTargetRequired
 	}
-	return nil
+	if !auth.AgentScoped {
+		if envelope.TransferID != auth.TransferID {
+			return sessions.ErrSessionNotFound
+		}
+		if !auth.allowsTarget(envelope.ToAgentID) {
+			return signaling.ErrRouteTargetRequired
+		}
+		return nil
+	}
+	transfer, err := r.service.VerifyTransferUsable(ctx, envelope.TransferID)
+	if err != nil {
+		return err
+	}
+	if transfer.Target != sessions.TargetAgent {
+		return signaling.ErrRouteTargetRequired
+	}
+	if auth.AgentID == transfer.FromAgentID && envelope.ToAgentID == transfer.ToAgentID {
+		return authorizeTransferRole(envelope.Type, true)
+	}
+	if auth.AgentID == transfer.ToAgentID && envelope.ToAgentID == transfer.FromAgentID {
+		return authorizeTransferRole(envelope.Type, false)
+	}
+	return signaling.ErrRouteTargetRequired
+}
+
+func authorizeTransferRole(messageType signaling.MessageType, fromSender bool) error {
+	switch messageType {
+	case signaling.MessageTransferOffer, signaling.MessageWebRTCOffer:
+		if fromSender {
+			return nil
+		}
+	case signaling.MessageTransferAccepted, signaling.MessageTransferDenied, signaling.MessageWebRTCAnswer:
+		if !fromSender {
+			return nil
+		}
+	case signaling.MessageWebRTCICE, signaling.MessageTransferStarted, signaling.MessageTransferProgress, signaling.MessageTransferCompleted, signaling.MessageTransferFailed, signaling.MessageTransferCancelled, signaling.MessageTransferExpired:
+		return nil
+	}
+	return signaling.ErrRouteTargetRequired
 }
 
 func errorEnvelope(message string) signaling.Envelope {

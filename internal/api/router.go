@@ -18,6 +18,7 @@ type Router struct {
 	service         *sessions.Service
 	presence        *signaling.PresenceRegistry
 	rooms           *signaling.RoomManager
+	agentAuth       AgentAuthenticator
 	recipientAssets fs.FS
 	upgrader        websocket.Upgrader
 }
@@ -28,19 +29,25 @@ func NewRouter(service *sessions.Service) http.Handler {
 }
 
 func NewRouterWithSignaling(service *sessions.Service, presence *signaling.PresenceRegistry, rooms *signaling.RoomManager) http.Handler {
+	return NewRouterWithSignalingAndAgentAuth(service, presence, rooms, nil)
+}
+
+func NewRouterWithSignalingAndAgentAuth(service *sessions.Service, presence *signaling.PresenceRegistry, rooms *signaling.RoomManager, agentAuth AgentAuthenticator) http.Handler {
 	if presence == nil {
 		presence = signaling.NewPresenceRegistry(nil)
 	}
 	if rooms == nil {
 		rooms = signaling.NewRoomManager(presence, nil)
 	}
-	return &Router{service: service, presence: presence, rooms: rooms, recipientAssets: recipient.DistFS(), upgrader: websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}}
+	return &Router{service: service, presence: presence, rooms: rooms, agentAuth: agentAuth, recipientAssets: recipient.DistFS(), upgrader: websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}}
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	switch {
 	case req.URL.Path == "/api/v1/agent/ws":
 		r.handleAgentWebSocket(w, req)
+	case req.URL.Path == "/api/v1/agents/ws":
+		r.handleAuthenticatedAgentWebSocket(w, req)
 	case strings.HasPrefix(req.URL.Path, "/api/public/transfers/") && strings.HasSuffix(req.URL.Path, "/receiver/ws"):
 		r.handleBrowserReceiverWebSocket(w, req)
 	case strings.HasPrefix(req.URL.Path, "/api/public/transfers/"):

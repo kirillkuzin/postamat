@@ -148,6 +148,61 @@ func TestRunAgentdCanAttachLocalSendsToBackend(t *testing.T) {
 	}
 }
 
+func TestRunAgentdMaintainsAlwaysOnReceiverPresenceWhenTokenConfigured(t *testing.T) {
+	messages := make(chan signaling.Envelope, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/api/v1/agents/ws" || req.URL.Query().Get("agent_id") != "agent-b" {
+			t.Fatalf("unexpected backend request %s %s", req.Method, req.URL.String())
+		}
+		if req.Header.Get("Authorization") != "Bearer token-b" {
+			t.Fatalf("unexpected Authorization header: %q", req.Header.Get("Authorization"))
+		}
+		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+		conn, err := upgrader.Upgrade(w, req, nil)
+		if err != nil {
+			t.Fatalf("upgrade backend ws: %v", err)
+		}
+		defer conn.Close()
+		var hello signaling.Envelope
+		if err := conn.ReadJSON(&hello); err != nil {
+			t.Fatalf("read always-on hello: %v", err)
+		}
+		messages <- hello
+		<-req.Context().Done()
+	}))
+	defer backend.Close()
+
+	socketPath := privateSocketPathForApp(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ready := make(chan string, 1)
+	errs := make(chan error, 1)
+	go func() {
+		errs <- app.Run(ctx, app.Options{Name: "agentd", LocalSocketPath: socketPath, BackendURL: backend.URL, AgentID: "agent-b", DeviceID: "dev-b", AgentAuthToken: "token-b", Ready: ready})
+	}()
+	select {
+	case <-ready:
+	case err := <-errs:
+		t.Fatalf("agentd exited before ready: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("agentd did not become ready")
+	}
+
+	hello := readAppSignalingMessage(t, messages, "always-on hello")
+	if hello.Type != signaling.MessageAgentHello || hello.AgentID != "agent-b" || hello.DeviceID != "dev-b" || hello.TransferID != "" {
+		t.Fatalf("unexpected always-on hello: %+v", hello)
+	}
+	cancel()
+	select {
+	case err := <-errs:
+		if err != nil {
+			t.Fatalf("agentd returned error after cancel: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("agentd did not stop after context cancellation")
+	}
+}
+
 func readAppSignalingMessage(t *testing.T, messages <-chan signaling.Envelope, label string) signaling.Envelope {
 	t.Helper()
 	select {

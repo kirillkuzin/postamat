@@ -114,8 +114,9 @@ func (m *RoomManager) detach(agentID string, deviceID string, peer Peer) {
 	if m.detachTransferPeerLocked(agentID, deviceID, peer) {
 		removed = true
 	}
-	stillOnline := len(m.peers[agentID]) > 0 || m.hasTransferPeerLocked(agentID)
-	if removed && !stillOnline {
+	deviceStillOnline := m.hasDevicePeerLocked(agentID, deviceID)
+	agentStillOnline := len(m.peers[agentID]) > 0 || m.hasTransferPeerLocked(agentID)
+	if removed && !agentStillOnline {
 		for transferID, agents := range m.active {
 			if _, ok := agents[agentID]; ok {
 				affected = append(affected, transferID)
@@ -125,7 +126,7 @@ func (m *RoomManager) detach(agentID string, deviceID string, peer Peer) {
 	}
 	m.mu.Unlock()
 
-	if removed {
+	if removed && !deviceStillOnline {
 		m.presence.Disconnect(agentID, deviceID)
 	}
 	if m.onDisconnect != nil {
@@ -154,6 +155,18 @@ func (m *RoomManager) detachTransferPeerLocked(agentID string, deviceID string, 
 		}
 	}
 	return removed
+}
+
+func (m *RoomManager) hasDevicePeerLocked(agentID string, deviceID string) bool {
+	if m.peers[agentID][deviceID] != nil {
+		return true
+	}
+	for _, agents := range m.transferPeers {
+		if agents[agentID][deviceID] != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *RoomManager) hasTransferPeerLocked(agentID string) bool {
