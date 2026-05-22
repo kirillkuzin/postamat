@@ -45,15 +45,16 @@ func (r *Router) handleAgentWebSocket(w http.ResponseWriter, req *http.Request) 
 		writeError(w, http.StatusUnauthorized, "invalid ticket")
 		return
 	}
-	allowedAgents := map[string]struct{}{transfer.FromAgentID: {}}
-	allowedTargets := map[string]struct{}{transfer.FromAgentID: {}}
+	allowedTargets := map[string]struct{}{}
 	if transfer.ToAgentID != "" {
-		allowedAgents[transfer.ToAgentID] = struct{}{}
 		allowedTargets[transfer.ToAgentID] = struct{}{}
 	} else {
 		allowedTargets[browserRecipientAgentID(transfer.ID)] = struct{}{}
 	}
-	r.handleSignalingWebSocket(w, req, websocketAuth{AllowedAgents: allowedAgents, AllowedTargets: allowedTargets, TransferID: transfer.ID})
+	// Agent tickets are issued to the sender that created the transfer. The
+	// receiver uses the authenticated always-on agent socket, so do not let a
+	// ticket holder self-assert the receiver role on this transfer-scoped socket.
+	r.handleSignalingWebSocket(w, req, websocketAuth{AgentID: transfer.FromAgentID, AllowedTargets: allowedTargets, TransferID: transfer.ID})
 }
 
 func (r *Router) handleAuthenticatedAgentWebSocket(w http.ResponseWriter, req *http.Request) {
@@ -197,6 +198,13 @@ func (r *Router) authorizeOutboundEnvelope(ctx context.Context, auth websocketAu
 		if !auth.allowsTarget(envelope.ToAgentID) {
 			return signaling.ErrRouteTargetRequired
 		}
+		transfer, err := r.service.VerifyTransferUsable(ctx, envelope.TransferID)
+		if err != nil {
+			return err
+		}
+		if transfer.Target == sessions.TargetAgent && auth.AgentID == transfer.FromAgentID && envelope.ToAgentID == transfer.ToAgentID {
+			return authorizeTransferRole(envelope.Type, true)
+		}
 		return nil
 	}
 	transfer, err := r.service.VerifyTransferUsable(ctx, envelope.TransferID)
@@ -225,8 +233,12 @@ func authorizeTransferRole(messageType signaling.MessageType, fromSender bool) e
 		if !fromSender {
 			return nil
 		}
-	case signaling.MessageWebRTCICE, signaling.MessageTransferStarted, signaling.MessageTransferProgress, signaling.MessageTransferCompleted, signaling.MessageTransferFailed, signaling.MessageTransferCancelled, signaling.MessageTransferExpired:
+	case signaling.MessageWebRTCICE, signaling.MessageTransferStarted, signaling.MessageTransferProgress, signaling.MessageTransferFailed, signaling.MessageTransferCancelled, signaling.MessageTransferExpired:
 		return nil
+	case signaling.MessageTransferCompleted:
+		if !fromSender {
+			return nil
+		}
 	}
 	return signaling.ErrRouteTargetRequired
 }
