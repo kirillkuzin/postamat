@@ -200,6 +200,38 @@ func TestDefaultKeyDeliveryPlansKeepRawKeysOutOfBackend(t *testing.T) {
 	assertJSONDoesNotContain(t, fragment, key.Bytes())
 }
 
+func TestAgentKeyEnvelopeJSONRoundTripsWithoutRawTransferKey(t *testing.T) {
+	key := mustTestTransferKey(t)
+	recipientPrivate, recipientPublic, err := GenerateAgentEnvelopeKeyPair()
+	if err != nil {
+		t.Fatalf("agent envelope key pair: %v", err)
+	}
+	envelope, err := WrapTransferKeyForAgent("agent-b", recipientPublic, key)
+	if err != nil {
+		t.Fatalf("agent key envelope: %v", err)
+	}
+
+	encoded, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	if bytes.Contains(encoded, key.Bytes()) || bytes.Contains(encoded, []byte(hex.EncodeToString(key.Bytes()))) || bytes.Contains(encoded, []byte(base64.StdEncoding.EncodeToString(key.Bytes()))) {
+		t.Fatalf("encoded envelope exposes raw transfer key: %s", encoded)
+	}
+
+	var decoded AgentKeyEnvelope
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal envelope: %v", err)
+	}
+	unwrapped, err := OpenAgentKeyEnvelope("agent-b", recipientPrivate, decoded)
+	if err != nil {
+		t.Fatalf("open decoded envelope: %v", err)
+	}
+	if unwrapped != key {
+		t.Fatalf("decoded envelope unwrapped wrong transfer key")
+	}
+}
+
 func assertJSONDoesNotContain(t *testing.T, v any, secret []byte) {
 	t.Helper()
 	encoded, err := json.Marshal(v)

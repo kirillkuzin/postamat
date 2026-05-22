@@ -167,7 +167,11 @@ func (r *LocalRouter) handleCancelTransfer(w http.ResponseWriter, req *http.Requ
 		writeLocalError(w, statusForJobError(err), err.Error())
 		return
 	}
-	job, err = r.jobs.Cancel(job.ID)
+	if r.backend != nil {
+		job, err = r.backend.CancelTransfer(req.Context(), job.ID)
+	} else {
+		job, err = r.jobs.Cancel(job.ID)
+	}
 	if err != nil {
 		writeLocalError(w, statusForJobError(err), err.Error())
 		return

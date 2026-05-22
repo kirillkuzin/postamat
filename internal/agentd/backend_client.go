@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/gorilla/websocket"
+	"github.com/kirillkuzin/postamat/internal/p2p"
 	"github.com/kirillkuzin/postamat/internal/sessions"
 	"github.com/kirillkuzin/postamat/internal/signaling"
 )
@@ -89,6 +90,29 @@ func (c *BackendClient) CreateTransfer(ctx context.Context, input CreateBackendT
 	return created, nil
 }
 
+func (c *BackendClient) CancelTransfer(ctx context.Context, transferID string) error {
+	if c == nil || c.baseURL == nil || c.baseURL.String() == "" {
+		return ErrBackendURLRequired
+	}
+	if transferID == "" {
+		return ErrTransferIDRequired
+	}
+	endpoint := c.resolve("/api/v1/transfers/" + url.PathEscape(transferID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint.String(), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("cancel backend transfer: status %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func (c *BackendClient) AgentWebSocketURL(transferID string, ticket string) (string, error) {
 	if c == nil || c.baseURL == nil || c.baseURL.String() == "" {
 		return "", ErrBackendURLRequired
@@ -128,12 +152,15 @@ func (c *BackendClient) resolve(path string) url.URL {
 }
 
 type BackendLoopOptions struct {
-	AgentID       string
-	DeviceID      string
-	Jobs          *JobManager
-	Inbox         *Inbox
-	Client        *BackendClient
-	ReceivePolicy ReceivePolicy
+	AgentID             string
+	DeviceID            string
+	Jobs                *JobManager
+	Inbox               *Inbox
+	Client              *BackendClient
+	ReceivePolicy       ReceivePolicy
+	AgentPrivateKey     []byte
+	RecipientPublicKeys map[string][]byte
+	GenerateTransferKey func() (p2p.TransferKey, error)
 }
 
 type ReceivePolicy struct {
@@ -143,8 +170,9 @@ type ReceivePolicy struct {
 }
 
 type transferOfferPayload struct {
-	FileName      string `json:"file_name"`
-	FileSizeBytes int64  `json:"file_size_bytes"`
+	FileName      string                `json:"file_name"`
+	FileSizeBytes int64                 `json:"file_size_bytes"`
+	KeyEnvelope   *p2p.AgentKeyEnvelope `json:"key_envelope,omitempty"`
 }
 
 type receivePolicyDecision struct {
@@ -175,13 +203,16 @@ func (p ReceivePolicy) Evaluate(fromAgentID string, offer transferOfferPayload) 
 }
 
 type BackendLoop struct {
-	mu            sync.Mutex
-	agentID       string
-	deviceID      string
-	jobs          *JobManager
-	inbox         *Inbox
-	client        *BackendClient
-	receivePolicy ReceivePolicy
+	mu                  sync.Mutex
+	agentID             string
+	deviceID            string
+	jobs                *JobManager
+	inbox               *Inbox
+	client              *BackendClient
+	receivePolicy       ReceivePolicy
+	agentPrivateKey     []byte
+	recipientPublicKeys map[string][]byte
+	generateTransferKey func() (p2p.TransferKey, error)
 }
 
 func NewBackendLoop(options BackendLoopOptions) *BackendLoop {
@@ -189,7 +220,32 @@ func NewBackendLoop(options BackendLoopOptions) *BackendLoop {
 	if jobs == nil {
 		jobs = NewJobManager(nil)
 	}
-	return &BackendLoop{agentID: options.AgentID, deviceID: options.DeviceID, jobs: jobs, inbox: options.Inbox, client: options.Client, receivePolicy: options.ReceivePolicy}
+	generateKey := options.GenerateTransferKey
+	if generateKey == nil {
+		generateKey = p2p.NewRandomTransferKey
+	}
+	return &BackendLoop{
+		agentID:             options.AgentID,
+		deviceID:            options.DeviceID,
+		jobs:                jobs,
+		inbox:               options.Inbox,
+		client:              options.Client,
+		receivePolicy:       options.ReceivePolicy,
+		agentPrivateKey:     append([]byte(nil), options.AgentPrivateKey...),
+		recipientPublicKeys: clonePublicKeys(options.RecipientPublicKeys),
+		generateTransferKey: generateKey,
+	}
+}
+
+func clonePublicKeys(keys map[string][]byte) map[string][]byte {
+	if len(keys) == 0 {
+		return nil
+	}
+	cloned := make(map[string][]byte, len(keys))
+	for agentID, key := range keys {
+		cloned[agentID] = append([]byte(nil), key...)
+	}
+	return cloned
 }
 
 func (l *BackendLoop) CreateSendTransfer(ctx context.Context, input CreateSendJobInput) (Job, error) {
@@ -209,7 +265,45 @@ func (l *BackendLoop) CreateSendTransfer(ctx context.Context, input CreateSendJo
 	if err != nil {
 		return Job{}, err
 	}
+	if recipientPublicKey := l.recipientPublicKeys[input.ToAgentID]; len(recipientPublicKey) > 0 {
+		transferKey, err := l.generateTransferKey()
+		if err != nil {
+			_, _ = l.jobs.Fail(job.ID, err.Error())
+			return Job{}, err
+		}
+		if _, err := p2p.WrapTransferKeyForAgent(input.ToAgentID, recipientPublicKey, transferKey); err != nil {
+			_, _ = l.jobs.Fail(job.ID, err.Error())
+			return Job{}, err
+		}
+		job, err = l.jobs.AttachTransferKey(job.ID, transferKey)
+		if err != nil {
+			return Job{}, err
+		}
+	}
 	return l.jobs.MarkOffered(job.ID)
+}
+
+func (l *BackendLoop) CancelTransfer(ctx context.Context, jobIDOrTransferID string) (Job, error) {
+	job, err := l.jobs.Get(jobIDOrTransferID)
+	if err != nil {
+		if !errors.Is(err, ErrJobNotFound) {
+			return Job{}, err
+		}
+		found, ok := l.jobs.FindByTransferID(jobIDOrTransferID)
+		if !ok {
+			return Job{}, ErrJobNotFound
+		}
+		job = found
+	}
+	if job.isTerminal() {
+		return Job{}, ErrJobTerminal
+	}
+	if job.TransferID != "" && l.client != nil {
+		if err := l.client.CancelTransfer(ctx, job.TransferID); err != nil {
+			return Job{}, err
+		}
+	}
+	return l.jobs.Cancel(job.ID)
 }
 
 func (l *BackendLoop) RunTransfer(ctx context.Context, job Job) error {
@@ -254,10 +348,22 @@ func (l *BackendLoop) RunTransfer(ctx context.Context, job Job) error {
 }
 
 func (l *BackendLoop) sendTransferOffer(conn *websocket.Conn, job Job) error {
-	payload, err := json.Marshal(map[string]any{
-		"file_name":       job.FileName,
-		"file_size_bytes": job.FileSizeBytes,
-	})
+	payloadData := transferOfferPayload{
+		FileName:      job.FileName,
+		FileSizeBytes: job.FileSizeBytes,
+	}
+	if job.HasTransferKey {
+		recipientPublicKey := l.recipientPublicKeys[job.ToAgentID]
+		if len(recipientPublicKey) == 0 {
+			return ErrTransferKeyRequired
+		}
+		envelope, err := p2p.WrapTransferKeyForAgent(job.ToAgentID, recipientPublicKey, job.TransferKey)
+		if err != nil {
+			return err
+		}
+		payloadData.KeyEnvelope = &envelope
+	}
+	payload, err := json.Marshal(payloadData)
 	if err != nil {
 		return err
 	}
@@ -360,6 +466,19 @@ func (l *BackendLoop) handleTransferOffer(send func(signaling.Envelope) error, e
 		}
 		return ErrOfferDeniedByPolicy
 	}
+	var transferKey p2p.TransferKey
+	hasTransferKey := false
+	if payload.KeyEnvelope != nil {
+		if len(l.agentPrivateKey) == 0 {
+			return ErrTransferKeyRequired
+		}
+		opened, err := p2p.OpenAgentKeyEnvelope(l.agentID, l.agentPrivateKey, *payload.KeyEnvelope)
+		if err != nil {
+			return err
+		}
+		transferKey = opened
+		hasTransferKey = true
+	}
 	destinationPath := ""
 	if l.inbox != nil {
 		entry, err := l.inbox.Reserve(InboxOffer{TransferID: envelope.TransferID, FromAgentID: envelope.FromAgentID, FileName: payload.FileName, FileSizeBytes: payload.FileSizeBytes})
@@ -371,6 +490,12 @@ func (l *BackendLoop) handleTransferOffer(send func(signaling.Envelope) error, e
 	job, err := l.jobs.CreateReceiveJob(CreateReceiveJobInput{TransferID: envelope.TransferID, FromAgentID: envelope.FromAgentID, FileName: payload.FileName, FileSizeBytes: payload.FileSizeBytes, DestinationPath: destinationPath})
 	if err != nil {
 		return err
+	}
+	if hasTransferKey {
+		job, err = l.jobs.AttachTransferKey(job.ID, transferKey)
+		if err != nil {
+			return err
+		}
 	}
 	if _, err := l.jobs.MarkAccepted(job.ID); err != nil {
 		return err

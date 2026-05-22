@@ -274,16 +274,17 @@ func OpenAgentKeyEnvelope(recipientAgentID string, recipientPrivateKey []byte, e
 	return TransferKeyFromBytes(plaintext)
 }
 
+type agentKeyEnvelopeWire struct {
+	Mode               KeyDeliveryMode `json:"mode"`
+	RecipientAgentID   string          `json:"recipient_agent_id"`
+	Algorithm          string          `json:"alg"`
+	EphemeralPublicKey []byte          `json:"ephemeral_public_key"`
+	Nonce              []byte          `json:"nonce"`
+	EncryptedKey       []byte          `json:"encrypted_key"`
+}
+
 func (e AgentKeyEnvelope) MarshalJSON() ([]byte, error) {
-	type wire struct {
-		Mode               KeyDeliveryMode `json:"mode"`
-		RecipientAgentID   string          `json:"recipient_agent_id"`
-		Algorithm          string          `json:"alg"`
-		EphemeralPublicKey []byte          `json:"ephemeral_public_key"`
-		Nonce              []byte          `json:"nonce"`
-		EncryptedKey       []byte          `json:"encrypted_key"`
-	}
-	return json.Marshal(wire{
+	return json.Marshal(agentKeyEnvelopeWire{
 		Mode:               e.mode,
 		RecipientAgentID:   e.recipientAgentID,
 		Algorithm:          e.algorithm,
@@ -291,6 +292,25 @@ func (e AgentKeyEnvelope) MarshalJSON() ([]byte, error) {
 		Nonce:              append([]byte(nil), e.nonce...),
 		EncryptedKey:       append([]byte(nil), e.encryptedKey...),
 	})
+}
+
+func (e *AgentKeyEnvelope) UnmarshalJSON(data []byte) error {
+	var wire agentKeyEnvelopeWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	if wire.Mode != KeyDeliveryAgentPublicKeyEnvelope || wire.RecipientAgentID == "" || wire.Algorithm != "X25519-SHA256-AES-256-GCM" || len(wire.EphemeralPublicKey) == 0 || len(wire.Nonce) != gcmNonceSize || len(wire.EncryptedKey) == 0 {
+		return ErrInvalidEncryptionMetadata
+	}
+	*e = AgentKeyEnvelope{
+		mode:               wire.Mode,
+		recipientAgentID:   wire.RecipientAgentID,
+		algorithm:          wire.Algorithm,
+		ephemeralPublicKey: append([]byte(nil), wire.EphemeralPublicKey...),
+		nonce:              append([]byte(nil), wire.Nonce...),
+		encryptedKey:       append([]byte(nil), wire.EncryptedKey...),
+	}
+	return nil
 }
 
 func deriveAgentWrappingKey(recipientAgentID string, shared []byte) [TransferKeySize]byte {
