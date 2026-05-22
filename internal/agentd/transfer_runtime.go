@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/kirillkuzin/postamat/internal/p2p"
 )
@@ -413,7 +414,14 @@ func isRunnableTransferStatus(status JobStatus) bool {
 }
 
 func isRetryableRuntimeError(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	message := err.Error()
+	return strings.Contains(message, context.Canceled.Error()) || strings.Contains(message, context.DeadlineExceeded.Error()) || strings.Contains(message, "remote peer closed") || strings.Contains(message, "data channel closed before open")
 }
 
 func markJobRetryableIfMutable(jobs *JobManager, jobID string, reason string) error {
@@ -427,6 +435,20 @@ func markJobRetryableIfMutable(jobs *JobManager, jobID string, reason string) er
 	switch job.Status {
 	case JobStatusRetryable:
 		return nil
+	case JobStatusOffered, JobStatusAccepted:
+		if job.Status == JobStatusOffered {
+			if _, err := jobs.MarkAccepted(jobID); err != nil {
+				return err
+			}
+		}
+		if _, err := jobs.MarkConnecting(jobID); err != nil {
+			return err
+		}
+		if _, err := jobs.Interrupt(jobID, reason); err != nil {
+			return err
+		}
+		_, err := jobs.MarkRetryable(jobID)
+		return err
 	case JobStatusInterrupted:
 		_, err = jobs.MarkRetryable(jobID)
 		return err

@@ -115,13 +115,22 @@ func (r *LocalRouter) createSendJob(req *http.Request, input CreateSendJobInput)
 			return Job{}, err
 		}
 		go func() {
-			if err := r.backend.RunTransfer(r.ctx, job); err != nil && r.ctx.Err() == nil {
-				_, _ = r.jobs.Fail(job.ID, err.Error())
-			}
+			r.handleRunTransferError(job.ID, r.backend.RunTransfer(r.ctx, job))
 		}()
 		return job, nil
 	}
 	return r.jobs.CreateSendJob(input)
+}
+
+func (r *LocalRouter) handleRunTransferError(jobID string, runErr error) {
+	if runErr == nil || r.ctx.Err() != nil {
+		return
+	}
+	job, err := r.jobs.Get(jobID)
+	if err == nil && (job.Status == JobStatusRetryable || job.Status == JobStatusInterrupted) {
+		return
+	}
+	_, _ = r.jobs.Fail(jobID, runErr.Error())
 }
 
 func (r *LocalRouter) handleTransfer(w http.ResponseWriter, req *http.Request) {

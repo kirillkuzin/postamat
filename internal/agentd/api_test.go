@@ -3,6 +3,7 @@ package agentd
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -114,6 +115,38 @@ func TestLocalAPICreateDelegatesToBackendLoopWhenConfigured(t *testing.T) {
 	gotOffer := readSignalingMessage(t, messages, "offer")
 	if gotOffer.Type != signaling.MessageTransferOffer || gotOffer.TransferID != "tr_backend" || gotOffer.FromAgentID != "agent-a" || gotOffer.ToAgentID != "agent-b" {
 		t.Fatalf("unexpected backend offer: %+v", gotOffer)
+	}
+}
+
+func TestLocalAPIRunTransferErrorDoesNotFailRetryableJob(t *testing.T) {
+	manager := NewJobManager(nil)
+	job, err := manager.CreateSendJob(CreateSendJobInput{SourcePath: "/tmp/report.pdf", ToAgentID: "agent-b", FileName: "report.pdf", FileSizeBytes: 42})
+	if err != nil {
+		t.Fatalf("CreateSendJob: %v", err)
+	}
+	job, err = manager.AttachTransfer(job.ID, "tr_retryable", "ticket")
+	if err != nil {
+		t.Fatalf("AttachTransfer: %v", err)
+	}
+	job, err = manager.MarkOffered(job.ID)
+	if err != nil {
+		t.Fatalf("MarkOffered: %v", err)
+	}
+	job, err = manager.MarkAccepted(job.ID)
+	if err != nil {
+		t.Fatalf("MarkAccepted: %v", err)
+	}
+	job = markRetryableJobForTest(t, manager, job.ID, 10)
+	router := NewLocalRouterWithBackend(manager, nil).(*LocalRouter)
+
+	router.handleRunTransferError(job.ID, errors.New("retryable runtime interruption"))
+
+	final, err := manager.Get(job.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if final.Status != JobStatusRetryable {
+		t.Fatalf("status = %s, want retryable", final.Status)
 	}
 }
 
