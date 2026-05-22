@@ -17,6 +17,12 @@ type PionDataChannel struct {
 type SessionDescription = webrtc.SessionDescription
 type ICECandidate = webrtc.ICECandidateInit
 
+const defaultSTUNServerURL = "stun:stun.l.google.com:19302"
+
+func defaultRemoteWebRTCConfiguration() webrtc.Configuration {
+	return webrtc.Configuration{ICEServers: []webrtc.ICEServer{{URLs: []string{defaultSTUNServerURL}}}}
+}
+
 type RemoteWebRTCPeer struct {
 	mu         sync.Mutex
 	pc         *webrtc.PeerConnection
@@ -109,7 +115,7 @@ func NewRemoteWebRTCAnswerPeer(onICECandidate func(ICECandidate)) (*RemoteWebRTC
 }
 
 func newRemoteWebRTCPeer(onICECandidate func(ICECandidate)) (*RemoteWebRTCPeer, error) {
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	pc, err := webrtc.NewPeerConnection(defaultRemoteWebRTCConfiguration())
 	if err != nil {
 		return nil, err
 	}
