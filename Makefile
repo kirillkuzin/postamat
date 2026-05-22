@@ -1,9 +1,9 @@
 SHELL := /usr/bin/env bash
 
-.PHONY: verify frontend-install frontend-build gofmt-check go-test go-coverage go-race go-vet go-build
+.PHONY: verify frontend-install frontend-build gofmt-check go-test go-coverage go-race go-vet go-build compose-config
 .NOTPARALLEL: verify
 
-verify: go-build
+verify: compose-config
 
 frontend-install:
 	cd web/recipient && npm ci --ignore-scripts
@@ -33,3 +33,6 @@ go-vet: go-race
 
 go-build: go-vet
 	go build ./cmd/server ./cmd/agentd ./cmd/postamat
+
+compose-config: go-build
+	docker compose --env-file deployments/.env.example -f deployments/compose.yaml config
