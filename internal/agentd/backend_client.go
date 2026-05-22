@@ -1231,7 +1231,19 @@ func (l *BackendLoop) completeTransferJob(transferID string) error {
 		return nil
 	}
 	if job.Status != JobStatusTransferring {
-		return ErrInvalidJobStatus
+		if err := l.markTransferStarted(transferID); err != nil {
+			return err
+		}
+		job, ok = l.jobs.FindByTransferID(transferID)
+		if !ok {
+			return ErrJobNotFound
+		}
+		if job.Status == JobStatusCompleted {
+			return nil
+		}
+		if job.Status != JobStatusTransferring {
+			return ErrInvalidJobStatus
+		}
 	}
 	if job.Direction == JobDirectionSend && job.ProgressBytes != job.FileSizeBytes {
 		return ErrProgressOutOfRange

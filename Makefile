@@ -1,6 +1,6 @@
 SHELL := /usr/bin/env bash
 
-.PHONY: verify frontend-install frontend-build gofmt-check go-test go-coverage go-race go-vet go-build compose-config
+.PHONY: verify frontend-install frontend-build gofmt-check go-test go-coverage coverage-badge go-race go-vet go-build compose-config
 .NOTPARALLEL: verify
 
 verify: compose-config
@@ -24,6 +24,10 @@ go-test: gofmt-check
 go-coverage: go-test
 	go test -covermode=atomic -coverprofile=coverage.out ./...
 	go tool cover -func=coverage.out | tee coverage.txt
+	python3 scripts/coverage_badge.py coverage.txt .github/badges/coverage.svg
+
+coverage-badge:
+	python3 scripts/coverage_badge.py coverage.txt .github/badges/coverage.svg
 
 go-race: go-coverage
 	go test -race ./internal/agentd ./internal/auth ./internal/agents ./internal/sessions ./internal/api ./internal/audit ./internal/db ./internal/signaling ./internal/p2p

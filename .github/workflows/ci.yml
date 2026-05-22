@@ -1,5 +1,8 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [master]
@@ -49,6 +52,12 @@ jobs:
         run: |
           go test -covermode=atomic -coverprofile=coverage.out ./...
           go tool cover -func=coverage.out | tee coverage.txt
+          python3 scripts/coverage_badge.py coverage.txt .github/badges/coverage.svg
+
+      - name: Check coverage badge is current
+        run: |
+          git ls-files --error-unmatch .github/badges/coverage.svg
+          git diff --exit-code .github/badges/coverage.svg
 
       - name: Run focused Go race tests
         run: go test -race ./internal/agentd ./internal/auth ./internal/agents ./internal/sessions ./internal/api ./internal/audit ./internal/db ./internal/signaling ./internal/p2p
