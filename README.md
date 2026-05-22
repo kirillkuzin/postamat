@@ -1,6 +1,7 @@
 # postamat
 
 [![CI](https://github.com/kirillkuzin/postamat/actions/workflows/ci.yml/badge.svg)](https://github.com/kirillkuzin/postamat/actions/workflows/ci.yml)
+![Coverage](.github/badges/coverage.svg)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 postamat is an open-source, agent-native secure transfer system. It coordinates transfer intent, agent presence, policy, audit, and WebRTC signaling while file bytes move directly between endpoints over encrypted WebRTC DataChannels.
@@ -61,14 +62,10 @@ internal/
   auth/           bearer tokens, transfer tickets, scoped identities
   build/          build/CI invariants
   config/         default configuration
-  crypto/         reserved package for shared crypto primitives
   db/             PostgreSQL-compatible repositories and schema tests
-  integrations/   protocol adapters such as MCP/ACP
   p2p/            WebRTC transport, chunk protocol, E2E encryption, sender/receiver
   sessions/       transfer lifecycle domain model and repositories
   signaling/      presence registry, rooms, SDP/ICE envelope routing
-  web/            reserved package for embedded web assets
-  worker/         reserved package for background workers
 migrations/       database migrations
 web/recipient/    browser-recipient frontend source; dist is generated and ignored
 deployments/      deployment manifests and reverse-proxy/TURN examples as they land

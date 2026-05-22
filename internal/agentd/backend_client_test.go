@@ -111,6 +111,7 @@ func TestBackendLoopLiveTwoAgentWebRTCRuntimeTransfersInboxFile(t *testing.T) {
 
 	receiverDone := make(chan error, 1)
 	go func() { receiverDone <- receiverLoop.RunReceiver(ctx) }()
+	waitForAgentOnlineForTest(t, server.URL, "agent-b")
 
 	sendJob, err := senderLoop.CreateSendTransfer(ctx, CreateSendJobInput{SourcePath: sourcePath, ToAgentID: "agent-b", FileName: "payload.txt", FileSizeBytes: int64(len(payload))})
 	if err != nil {
@@ -321,6 +322,39 @@ func TestBackendLoopRejectsPrematureCompletion(t *testing.T) {
 	}
 	if after.Status != JobStatusOffered || after.CompletedAt != nil {
 		t.Fatalf("premature completed message mutated job: %+v", after)
+	}
+}
+
+func TestBackendLoopCompletesSendJobWhenRemoteCompletionArrivesBeforeStarted(t *testing.T) {
+	manager := NewJobManager(nil)
+	job, err := manager.CreateSendJob(CreateSendJobInput{SourcePath: "/tmp/payload.bin", ToAgentID: "agent-b", FileName: "payload.bin", FileSizeBytes: 10})
+	if err != nil {
+		t.Fatalf("CreateSendJob returned error: %v", err)
+	}
+	job, err = manager.AttachTransfer(job.ID, "tr_1", "ticket_1")
+	if err != nil {
+		t.Fatalf("AttachTransfer returned error: %v", err)
+	}
+	if _, err := manager.MarkOffered(job.ID); err != nil {
+		t.Fatalf("MarkOffered returned error: %v", err)
+	}
+	if _, err := manager.MarkAccepted(job.ID); err != nil {
+		t.Fatalf("MarkAccepted returned error: %v", err)
+	}
+	if _, err := manager.UpdateProgress(job.ID, 10); err != nil {
+		t.Fatalf("UpdateProgress returned error: %v", err)
+	}
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-a", DeviceID: "dev-1", Jobs: manager, Client: NewBackendClient("https://postamat.example", nil)})
+
+	if err := loop.HandleEnvelope(context.Background(), signaling.Envelope{Type: signaling.MessageTransferCompleted, TransferID: "tr_1", FromAgentID: "agent-b", ToAgentID: "agent-a"}); err != nil {
+		t.Fatalf("HandleEnvelope returned error: %v", err)
+	}
+	final, err := manager.Get(job.ID)
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	if final.Status != JobStatusCompleted || final.CompletedAt == nil {
+		t.Fatalf("send job not completed after out-of-order remote completion: %+v", final)
 	}
 }
 
@@ -877,6 +911,31 @@ func keyedAgentOfferPayloadForTest(t *testing.T, recipientAgentID string, fileNa
 		t.Fatalf("marshal transfer offer payload: %v", err)
 	}
 	return payload, transferKey, recipientPrivate
+}
+
+func waitForAgentOnlineForTest(t *testing.T, baseURL string, agentID string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		response, err := http.Get(baseURL + "/api/v1/agents/" + agentID)
+		if err == nil {
+			var payload struct {
+				Status  string `json:"status"`
+				Devices int    `json:"devices"`
+			}
+			decodeErr := json.NewDecoder(response.Body).Decode(&payload)
+			_ = response.Body.Close()
+			if response.StatusCode == http.StatusOK && decodeErr == nil && payload.Status == "online" && payload.Devices > 0 {
+				return
+			}
+		} else if response != nil {
+			_ = response.Body.Close()
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("agent %s did not become online before transfer", agentID)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func writeJSONForTest(w http.ResponseWriter, status int, payload any) {
