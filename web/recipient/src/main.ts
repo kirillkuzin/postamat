@@ -65,6 +65,7 @@ type BrowserReceiveState = {
 }
 
 const defaultBrowserAgentID = 'browser_recipient'
+const defaultICEServers: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }]
 const app = document.querySelector<HTMLDivElement>('#app')
 const token = readTokenFromPath()
 let socket: WebSocket | undefined
@@ -342,7 +343,7 @@ async function acceptWebRTCOffer(ws: WebSocket, transfer: PublicTransfer, browse
   await prepareBrowserReceive(transfer, browserAgentID)
   const state = receiveState
   if (!state) throw new Error('Browser receive state was not initialized.')
-  const peer = new RTCPeerConnection()
+  const peer = new RTCPeerConnection({ iceServers: defaultICEServers })
   state.peer?.close()
   state.peer = peer
   peer.onicecandidate = (event) => {

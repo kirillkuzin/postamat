@@ -75,6 +75,24 @@ func TestLocalWebRTCPairFailureDoesNotHang(t *testing.T) {
 	}
 }
 
+func TestRemoteWebRTCDefaultConfigurationIncludesSTUN(t *testing.T) {
+	config := defaultRemoteWebRTCConfiguration()
+	if len(config.ICEServers) == 0 {
+		t.Fatal("remote WebRTC config has no ICE servers; external browser links need STUN/TURN, not localhost-only ICE")
+	}
+	found := false
+	for _, server := range config.ICEServers {
+		for _, rawURL := range server.URLs {
+			if rawURL == defaultSTUNServerURL {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("remote WebRTC config ICE servers = %#v, want %s", config.ICEServers, defaultSTUNServerURL)
+	}
+}
+
 func TestRemoteWebRTCPeersTransferWithBufferedICE(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
