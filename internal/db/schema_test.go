@@ -19,7 +19,7 @@ func TestInitialMigrationDefinesImportantConstraintsAndIndexes(t *testing.T) {
 	schema := readInitialMigration(t)
 	checks := []string{
 		"target IN ('agent', 'browser_link')",
-		"status IN ('created', 'offered', 'accepted', 'connecting', 'transferring', 'completed', 'failed', 'cancelled', 'expired')",
+		"status IN ('created', 'offered', 'accepted', 'connecting', 'transferring', 'interrupted', 'retryable', 'completed', 'failed', 'cancelled', 'expired')",
 		"role IN ('sender_agent', 'receiving_agent', 'browser_recipient')",
 		"REFERENCES agents(id)",
 		"REFERENCES transfers(id)",
@@ -30,6 +30,7 @@ func TestInitialMigrationDefinesImportantConstraintsAndIndexes(t *testing.T) {
 		"agent_ticket_hash TEXT NOT NULL UNIQUE",
 		"receiver_ticket_hash TEXT",
 		"receiver_ticket_expires_at TIMESTAMPTZ",
+		"interrupted_at TIMESTAMPTZ",
 		"raw_token",
 	}
 	for _, check := range checks {

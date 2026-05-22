@@ -95,6 +95,32 @@ func TestJobManagerTracksTransferAndProgressLifecycle(t *testing.T) {
 	}
 }
 
+func TestJobManagerMarkConnectingIsIdempotentDuringConcurrentStart(t *testing.T) {
+	manager := NewJobManager(nil)
+	job, err := manager.CreateSendJob(CreateSendJobInput{SourcePath: "/tmp/a.bin", ToAgentID: "agent-b", FileName: "a.bin", FileSizeBytes: 100})
+	if err != nil {
+		t.Fatalf("CreateSendJob returned error: %v", err)
+	}
+	if _, err := manager.MarkOffered(job.ID); err != nil {
+		t.Fatalf("MarkOffered returned error: %v", err)
+	}
+	if _, err := manager.MarkAccepted(job.ID); err != nil {
+		t.Fatalf("MarkAccepted returned error: %v", err)
+	}
+	if _, err := manager.MarkConnecting(job.ID); err != nil {
+		t.Fatalf("MarkConnecting returned error: %v", err)
+	}
+	if _, err := manager.MarkConnecting(job.ID); err != nil {
+		t.Fatalf("second MarkConnecting should be idempotent while connecting: %v", err)
+	}
+	if _, err := manager.MarkTransferring(job.ID); err != nil {
+		t.Fatalf("MarkTransferring returned error: %v", err)
+	}
+	if _, err := manager.MarkConnecting(job.ID); err != nil {
+		t.Fatalf("MarkConnecting should be idempotent after transfer started: %v", err)
+	}
+}
+
 func TestJobManagerRejectsInvalidProgressAndAllowsCancel(t *testing.T) {
 	manager := NewJobManager(func() time.Time { return time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC) })
 	job, err := manager.CreateReceiveJob(CreateReceiveJobInput{TransferID: "tr_1", FromAgentID: "agent-a", FileName: "payload.bin", FileSizeBytes: 10})
@@ -134,6 +160,64 @@ func TestJobManagerRejectsCompletionBeforeTransferring(t *testing.T) {
 	}
 	if after.Status != JobStatusOffered || after.CompletedAt != nil {
 		t.Fatalf("invalid completion mutated job: %+v", after)
+	}
+}
+
+func TestJobManagerInterruptedCanBecomeRetryableAndReconnect(t *testing.T) {
+	manager := NewJobManager(func() time.Time { return time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC) })
+	job, err := manager.CreateSendJob(CreateSendJobInput{SourcePath: "/tmp/a.bin", ToAgentID: "agent-b", FileName: "a.bin", FileSizeBytes: 100})
+	if err != nil {
+		t.Fatalf("CreateSendJob returned error: %v", err)
+	}
+	if _, err := manager.AttachTransfer(job.ID, "tr_retry", "ticket"); err != nil {
+		t.Fatalf("AttachTransfer returned error: %v", err)
+	}
+	for _, step := range []func(string) (Job, error){manager.MarkOffered, manager.MarkAccepted, manager.MarkConnecting, manager.MarkTransferring} {
+		if _, err := step(job.ID); err != nil {
+			t.Fatalf("lifecycle step returned error: %v", err)
+		}
+	}
+
+	interrupted, err := manager.Interrupt(job.ID, "network dropped")
+	if err != nil {
+		t.Fatalf("Interrupt returned error: %v", err)
+	}
+	if interrupted.Status != JobStatusInterrupted || interrupted.InterruptedAt == nil || interrupted.FailureReason != "network dropped" {
+		t.Fatalf("interrupted job = %+v", interrupted)
+	}
+
+	retryable, err := manager.MarkRetryable(job.ID)
+	if err != nil {
+		t.Fatalf("MarkRetryable returned error: %v", err)
+	}
+	if retryable.Status != JobStatusRetryable {
+		t.Fatalf("retryable status = %q", retryable.Status)
+	}
+	if _, err := manager.MarkConnecting(job.ID); err != nil {
+		t.Fatalf("retryable job did not reconnect: %v", err)
+	}
+}
+
+func TestJobManagerRejectsInvalidInterruptedRetryableTransitions(t *testing.T) {
+	manager := NewJobManager(nil)
+	job, err := manager.CreateSendJob(CreateSendJobInput{SourcePath: "/tmp/a.bin", ToAgentID: "agent-b", FileName: "a.bin", FileSizeBytes: 100})
+	if err != nil {
+		t.Fatalf("CreateSendJob returned error: %v", err)
+	}
+	if _, err := manager.Interrupt(job.ID, ""); !errors.Is(err, ErrFailureReasonRequired) {
+		t.Fatalf("Interrupt empty reason error = %v, want ErrFailureReasonRequired", err)
+	}
+	if _, err := manager.Interrupt(job.ID, "too early"); !errors.Is(err, ErrInvalidJobStatus) {
+		t.Fatalf("Interrupt queued job error = %v, want ErrInvalidJobStatus", err)
+	}
+	if _, err := manager.MarkRetryable(job.ID); !errors.Is(err, ErrInvalidJobStatus) {
+		t.Fatalf("MarkRetryable queued job error = %v, want ErrInvalidJobStatus", err)
+	}
+	if _, err := manager.Cancel(job.ID); err != nil {
+		t.Fatalf("Cancel returned error: %v", err)
+	}
+	if _, err := manager.Interrupt(job.ID, "terminal"); !errors.Is(err, ErrJobTerminal) {
+		t.Fatalf("Interrupt terminal job error = %v, want ErrJobTerminal", err)
 	}
 }
 

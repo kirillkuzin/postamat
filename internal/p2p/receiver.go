@@ -34,6 +34,20 @@ func NewReceiver(transferID string, destination io.Writer, options ReceiverOptio
 	return &Receiver{transferID: transferID, writer: destination, options: options, hash: sha256.New()}
 }
 
+func (r *Receiver) Ack() Ack {
+	if r == nil {
+		return Ack{}
+	}
+	return Ack{TransferID: r.transferID, NextSequence: r.nextSeq, NextOffset: r.offset}
+}
+
+func (r *Receiver) ResumeManifest(totalBytes int64) ResumeManifest {
+	if r == nil {
+		return ResumeManifest{}
+	}
+	return ResumeManifest{TransferID: r.transferID, NextSequence: r.nextSeq, NextOffset: r.offset, TotalBytes: totalBytes, SHA256Hex: hex.EncodeToString(r.hash.Sum(nil))}
+}
+
 func (r *Receiver) Accept(encoded []byte) (*Manifest, error) {
 	if r == nil || r.writer == nil || r.transferID == "" {
 		return nil, fmt.Errorf("%w: missing receiver endpoint", ErrTransferFailed)

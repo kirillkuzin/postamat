@@ -26,6 +26,8 @@ const (
 	JobStatusAccepted     JobStatus = "accepted"
 	JobStatusConnecting   JobStatus = "connecting"
 	JobStatusTransferring JobStatus = "transferring"
+	JobStatusInterrupted  JobStatus = "interrupted"
+	JobStatusRetryable    JobStatus = "retryable"
 	JobStatusCompleted    JobStatus = "completed"
 	JobStatusFailed       JobStatus = "failed"
 	JobStatusCancelled    JobStatus = "cancelled"
@@ -74,6 +76,7 @@ type Job struct {
 	CreatedAt       time.Time       `json:"created_at"`
 	UpdatedAt       time.Time       `json:"updated_at"`
 	CompletedAt     *time.Time      `json:"completed_at,omitempty"`
+	InterruptedAt   *time.Time      `json:"interrupted_at,omitempty"`
 	FailedAt        *time.Time      `json:"failed_at,omitempty"`
 	CancelledAt     *time.Time      `json:"cancelled_at,omitempty"`
 	sequence        int64
@@ -227,7 +230,21 @@ func (m *JobManager) MarkAccepted(jobID string) (Job, error) {
 }
 
 func (m *JobManager) MarkConnecting(jobID string) (Job, error) {
-	return m.transition(jobID, JobStatusAccepted, JobStatusConnecting)
+	return m.update(jobID, func(job *Job, now time.Time) error {
+		if job.isTerminal() {
+			return ErrJobTerminal
+		}
+		switch job.Status {
+		case JobStatusAccepted, JobStatusRetryable:
+			job.Status = JobStatusConnecting
+			job.UpdatedAt = now
+			return nil
+		case JobStatusConnecting, JobStatusTransferring:
+			return nil
+		default:
+			return ErrInvalidJobStatus
+		}
+	}, JobEvent{Type: JobEventStatusChanged})
 }
 
 func (m *JobManager) MarkTransferring(jobID string) (Job, error) {
@@ -246,6 +263,29 @@ func (m *JobManager) UpdateProgress(jobID string, progressBytes int64) (Job, err
 		job.UpdatedAt = now
 		return nil
 	}, JobEvent{Type: JobEventProgress, ProgressBytes: progressBytes})
+}
+
+func (m *JobManager) Interrupt(jobID string, reason string) (Job, error) {
+	if reason == "" {
+		return Job{}, ErrFailureReasonRequired
+	}
+	return m.update(jobID, func(job *Job, now time.Time) error {
+		if job.isTerminal() {
+			return ErrJobTerminal
+		}
+		if job.Status != JobStatusConnecting && job.Status != JobStatusTransferring {
+			return ErrInvalidJobStatus
+		}
+		job.Status = JobStatusInterrupted
+		job.FailureReason = reason
+		job.InterruptedAt = cloneTime(now)
+		job.UpdatedAt = now
+		return nil
+	}, JobEvent{Type: JobEventStatusChanged, Status: JobStatusInterrupted, Message: reason})
+}
+
+func (m *JobManager) MarkRetryable(jobID string) (Job, error) {
+	return m.transition(jobID, JobStatusInterrupted, JobStatusRetryable)
 }
 
 func (m *JobManager) Complete(jobID string) (Job, error) {
@@ -419,6 +459,10 @@ func cloneJob(job Job) Job {
 	if job.CompletedAt != nil {
 		completedAt := *job.CompletedAt
 		job.CompletedAt = &completedAt
+	}
+	if job.InterruptedAt != nil {
+		interruptedAt := *job.InterruptedAt
+		job.InterruptedAt = &interruptedAt
 	}
 	if job.FailedAt != nil {
 		failedAt := *job.FailedAt

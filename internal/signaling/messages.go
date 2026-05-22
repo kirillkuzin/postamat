@@ -8,24 +8,26 @@ import (
 type MessageType string
 
 const (
-	MessageAgentHello        MessageType = "agent.hello"
-	MessageAgentPresence     MessageType = "agent.presence"
-	MessageTransferOffer     MessageType = "transfer.offer"
-	MessageTransferAccepted  MessageType = "transfer.accepted"
-	MessageTransferDenied    MessageType = "transfer.denied"
-	MessageWebRTCOffer       MessageType = "webrtc.offer"
-	MessageWebRTCAnswer      MessageType = "webrtc.answer"
-	MessageWebRTCICE         MessageType = "webrtc.ice"
-	MessageTransferStarted   MessageType = "transfer.started"
-	MessageTransferProgress  MessageType = "transfer.progress"
-	MessageTransferCompleted MessageType = "transfer.completed"
-	MessageTransferFailed    MessageType = "transfer.failed"
-	MessageTransferCancelled MessageType = "transfer.cancelled"
-	MessageTransferExpired   MessageType = "transfer.expired"
-	MessageAgentDisconnected MessageType = "agent.disconnected"
-	MessagePing              MessageType = "ping"
-	MessagePong              MessageType = "pong"
-	MessageError             MessageType = "error"
+	MessageAgentHello          MessageType = "agent.hello"
+	MessageAgentPresence       MessageType = "agent.presence"
+	MessageTransferOffer       MessageType = "transfer.offer"
+	MessageTransferAccepted    MessageType = "transfer.accepted"
+	MessageTransferDenied      MessageType = "transfer.denied"
+	MessageWebRTCOffer         MessageType = "webrtc.offer"
+	MessageWebRTCAnswer        MessageType = "webrtc.answer"
+	MessageWebRTCICE           MessageType = "webrtc.ice"
+	MessageTransferStarted     MessageType = "transfer.started"
+	MessageTransferProgress    MessageType = "transfer.progress"
+	MessageTransferInterrupted MessageType = "transfer.interrupted"
+	MessageTransferRetryable   MessageType = "transfer.retryable"
+	MessageTransferCompleted   MessageType = "transfer.completed"
+	MessageTransferFailed      MessageType = "transfer.failed"
+	MessageTransferCancelled   MessageType = "transfer.cancelled"
+	MessageTransferExpired     MessageType = "transfer.expired"
+	MessageAgentDisconnected   MessageType = "agent.disconnected"
+	MessagePing                MessageType = "ping"
+	MessagePong                MessageType = "pong"
+	MessageError               MessageType = "error"
 )
 
 var (
@@ -77,7 +79,7 @@ func (e Envelope) Validate() error {
 		if e.AgentID == "" {
 			return ErrAgentIDRequired
 		}
-	case MessageTransferOffer, MessageTransferAccepted, MessageTransferDenied, MessageTransferStarted, MessageTransferProgress, MessageTransferCompleted, MessageTransferFailed, MessageTransferCancelled, MessageTransferExpired:
+	case MessageTransferOffer, MessageTransferAccepted, MessageTransferDenied, MessageTransferStarted, MessageTransferProgress, MessageTransferInterrupted, MessageTransferRetryable, MessageTransferCompleted, MessageTransferFailed, MessageTransferCancelled, MessageTransferExpired:
 		if e.TransferID == "" {
 			return ErrTransferIDRequired
 		}
@@ -94,7 +96,7 @@ func (e Envelope) Validate() error {
 
 func isSupportedMessageType(messageType MessageType) bool {
 	switch messageType {
-	case MessageAgentHello, MessageAgentPresence, MessageTransferOffer, MessageTransferAccepted, MessageTransferDenied, MessageWebRTCOffer, MessageWebRTCAnswer, MessageWebRTCICE, MessageTransferStarted, MessageTransferProgress, MessageTransferCompleted, MessageTransferFailed, MessageTransferCancelled, MessageTransferExpired, MessageAgentDisconnected, MessagePing, MessagePong, MessageError:
+	case MessageAgentHello, MessageAgentPresence, MessageTransferOffer, MessageTransferAccepted, MessageTransferDenied, MessageWebRTCOffer, MessageWebRTCAnswer, MessageWebRTCICE, MessageTransferStarted, MessageTransferProgress, MessageTransferInterrupted, MessageTransferRetryable, MessageTransferCompleted, MessageTransferFailed, MessageTransferCancelled, MessageTransferExpired, MessageAgentDisconnected, MessagePing, MessagePong, MessageError:
 		return true
 	default:
 		return false

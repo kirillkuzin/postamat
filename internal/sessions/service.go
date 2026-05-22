@@ -229,6 +229,18 @@ func (s *Service) MarkFailed(ctx context.Context, id string, reason string) (Tra
 	})
 }
 
+func (s *Service) MarkInterrupted(ctx context.Context, id string, reason string) (TransferSession, error) {
+	return s.repo.Update(ctx, id, func(session *TransferSession) error {
+		return session.MarkInterrupted(reason, s.now())
+	})
+}
+
+func (s *Service) MarkRetryable(ctx context.Context, id string) (TransferSession, error) {
+	return s.repo.Update(ctx, id, func(session *TransferSession) error {
+		return session.MarkRetryable()
+	})
+}
+
 func (s *Service) Expire(ctx context.Context, id string) (TransferSession, error) {
 	return s.repo.Update(ctx, id, func(session *TransferSession) error {
 		return session.Expire(s.now())

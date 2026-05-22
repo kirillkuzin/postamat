@@ -85,12 +85,12 @@ func (r *TransferRepository) Update(ctx context.Context, id string, update func(
 	return transfer, nil
 }
 
-const transferColumns = "id, transport, target, status, from_agent_id, to_agent_id, public_token_hash, agent_ticket_hash, receiver_ticket_hash, receiver_ticket_expires_at, file_name, file_size_bytes, file_sha256, mime_type, expires_at, max_downloads, download_count, password_hash, created_at, completed_at, failed_at, cancelled_at, expired_at, failure_reason"
+const transferColumns = "id, transport, target, status, from_agent_id, to_agent_id, public_token_hash, agent_ticket_hash, receiver_ticket_hash, receiver_ticket_expires_at, file_name, file_size_bytes, file_sha256, mime_type, expires_at, max_downloads, download_count, password_hash, created_at, completed_at, interrupted_at, failed_at, cancelled_at, expired_at, failure_reason"
 
 const selectTransferSQL = "SELECT " + transferColumns + " FROM transfers"
 
 const upsertTransferSQL = `INSERT INTO transfers (` + transferColumns + `)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
 ON CONFLICT (id) DO UPDATE SET
     transport = EXCLUDED.transport,
     target = EXCLUDED.target,
@@ -111,19 +111,20 @@ ON CONFLICT (id) DO UPDATE SET
     password_hash = EXCLUDED.password_hash,
     created_at = EXCLUDED.created_at,
     completed_at = EXCLUDED.completed_at,
+    interrupted_at = EXCLUDED.interrupted_at,
     failed_at = EXCLUDED.failed_at,
     cancelled_at = EXCLUDED.cancelled_at,
     expired_at = EXCLUDED.expired_at,
     failure_reason = EXCLUDED.failure_reason`
 
 func transferArgs(s sessions.TransferSession) []any {
-	return []any{s.ID, s.Transport, s.Target, s.Status, s.FromAgentID, nullIfEmpty(s.ToAgentID), nullIfEmpty(s.PublicTokenHash), s.AgentTicketHash, nullIfEmpty(s.ReceiverTicketHash), timePtrOrNil(s.ReceiverTicketExpiresAt), s.FileName, s.FileSizeBytes, nullIfEmpty(s.FileSHA256), nullIfEmpty(s.MimeType), s.ExpiresAt, s.MaxDownloads, s.DownloadCount, s.PasswordHash, s.CreatedAt, s.CompletedAt, s.FailedAt, s.CancelledAt, s.ExpiredAt, nullIfEmpty(s.FailureReason)}
+	return []any{s.ID, s.Transport, s.Target, s.Status, s.FromAgentID, nullIfEmpty(s.ToAgentID), nullIfEmpty(s.PublicTokenHash), s.AgentTicketHash, nullIfEmpty(s.ReceiverTicketHash), timePtrOrNil(s.ReceiverTicketExpiresAt), s.FileName, s.FileSizeBytes, nullIfEmpty(s.FileSHA256), nullIfEmpty(s.MimeType), s.ExpiresAt, s.MaxDownloads, s.DownloadCount, s.PasswordHash, s.CreatedAt, s.CompletedAt, s.InterruptedAt, s.FailedAt, s.CancelledAt, s.ExpiredAt, nullIfEmpty(s.FailureReason)}
 }
 
 func scanTransfer(row pgx.Row) (sessions.TransferSession, error) {
 	var session sessions.TransferSession
 	var toAgentID, publicTokenHash, receiverTicketHash, fileSHA256, mimeType, failureReason sql.NullString
-	if err := row.Scan(&session.ID, &session.Transport, &session.Target, &session.Status, &session.FromAgentID, &toAgentID, &publicTokenHash, &session.AgentTicketHash, &receiverTicketHash, &session.ReceiverTicketExpiresAt, &session.FileName, &session.FileSizeBytes, &fileSHA256, &mimeType, &session.ExpiresAt, &session.MaxDownloads, &session.DownloadCount, &session.PasswordHash, &session.CreatedAt, &session.CompletedAt, &session.FailedAt, &session.CancelledAt, &session.ExpiredAt, &failureReason); err != nil {
+	if err := row.Scan(&session.ID, &session.Transport, &session.Target, &session.Status, &session.FromAgentID, &toAgentID, &publicTokenHash, &session.AgentTicketHash, &receiverTicketHash, &session.ReceiverTicketExpiresAt, &session.FileName, &session.FileSizeBytes, &fileSHA256, &mimeType, &session.ExpiresAt, &session.MaxDownloads, &session.DownloadCount, &session.PasswordHash, &session.CreatedAt, &session.CompletedAt, &session.InterruptedAt, &session.FailedAt, &session.CancelledAt, &session.ExpiredAt, &failureReason); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return sessions.TransferSession{}, sessions.ErrSessionNotFound
 		}

@@ -254,6 +254,35 @@ func TestAgentWebSocketReceivesRoutedOffer(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedAgentWebSocketRoutesInterruptedAndRetryableState(t *testing.T) {
+	service := secureTestService()
+	created := createWSTransfer(t, service, sessions.TargetAgent)
+	presence := signaling.NewPresenceRegistry(nil)
+	rooms := signaling.NewRoomManager(presence, nil)
+	server := httptest.NewServer(api.NewRouterWithSignalingAndAgentAuth(service, presence, rooms, testAgentAuth(t, map[string]string{"agent_a": "token-a", "agent_b": "token-b"})))
+	defer server.Close()
+
+	sender := dialAuthenticatedAgentWS(t, server.URL, "agent_a", "token-a")
+	defer sender.Close()
+	writeEnvelope(t, sender, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "agent_a", DeviceID: "dev_a"})
+	readEnvelope(t, sender)
+
+	receiver := dialAuthenticatedAgentWS(t, server.URL, "agent_b", "token-b")
+	defer receiver.Close()
+	writeEnvelope(t, receiver, signaling.Envelope{Type: signaling.MessageAgentHello, AgentID: "agent_b", DeviceID: "dev_b"})
+	readEnvelope(t, receiver)
+
+	writeEnvelope(t, sender, signaling.Envelope{Type: signaling.MessageTransferInterrupted, TransferID: created.Transfer.ID, FromAgentID: "agent_a", ToAgentID: "agent_b"})
+	if got := readEnvelope(t, receiver); got.Type != signaling.MessageTransferInterrupted || got.TransferID != created.Transfer.ID || got.FromAgentID != "agent_a" || got.ToAgentID != "agent_b" {
+		t.Fatalf("receiver got unexpected interrupted envelope: %+v", got)
+	}
+
+	writeEnvelope(t, receiver, signaling.Envelope{Type: signaling.MessageTransferRetryable, TransferID: created.Transfer.ID, FromAgentID: "agent_b", ToAgentID: "agent_a"})
+	if got := readEnvelope(t, sender); got.Type != signaling.MessageTransferRetryable || got.TransferID != created.Transfer.ID || got.FromAgentID != "agent_b" || got.ToAgentID != "agent_a" {
+		t.Fatalf("sender got unexpected retryable envelope: %+v", got)
+	}
+}
+
 func TestAgentWebSocketRoutesWebRTCOfferFromTicketScopedSenderToAlwaysOnAgent(t *testing.T) {
 	service := secureTestService()
 	created := createWSTransfer(t, service, sessions.TargetAgent)

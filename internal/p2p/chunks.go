@@ -12,8 +12,10 @@ const ProtocolVersion = 1
 type FrameType string
 
 const (
-	FrameTypeChunk    FrameType = "chunk"
-	FrameTypeManifest FrameType = "manifest"
+	FrameTypeChunk          FrameType = "chunk"
+	FrameTypeManifest       FrameType = "manifest"
+	FrameTypeAck            FrameType = "ack"
+	FrameTypeResumeManifest FrameType = "resume_manifest"
 )
 
 var (
@@ -23,7 +25,9 @@ var (
 	ErrTransferIDRequired         = errors.New("transfer id is required")
 	ErrChunkDataRequired          = errors.New("chunk data is required")
 	ErrNegativeOffset             = errors.New("chunk offset must be non-negative")
+	ErrNegativeNextOffset         = errors.New("next offset must be non-negative")
 	ErrNegativeTotalBytes         = errors.New("total bytes must be non-negative")
+	ErrResumePastTotalBytes       = errors.New("resume offset is past total bytes")
 	ErrInvalidChunkCount          = errors.New("chunk count must be positive")
 	ErrSHA256Required             = errors.New("sha256 is required")
 	ErrUnexpectedTransferID       = errors.New("unexpected transfer id")
@@ -35,16 +39,18 @@ var (
 )
 
 type Frame struct {
-	Version    int                 `json:"v"`
-	Type       FrameType           `json:"type"`
-	TransferID string              `json:"transfer_id"`
-	Sequence   uint64              `json:"seq,omitempty"`
-	Offset     int64               `json:"offset,omitempty"`
-	Data       []byte              `json:"data,omitempty"`
-	Encryption *EncryptionMetadata `json:"enc,omitempty"`
-	TotalBytes int64               `json:"total_bytes,omitempty"`
-	ChunkCount uint64              `json:"chunk_count,omitempty"`
-	SHA256Hex  string              `json:"sha256,omitempty"`
+	Version      int                 `json:"v"`
+	Type         FrameType           `json:"type"`
+	TransferID   string              `json:"transfer_id"`
+	Sequence     uint64              `json:"seq,omitempty"`
+	Offset       int64               `json:"offset,omitempty"`
+	NextSequence uint64              `json:"next_seq,omitempty"`
+	NextOffset   int64               `json:"next_offset,omitempty"`
+	Data         []byte              `json:"data,omitempty"`
+	Encryption   *EncryptionMetadata `json:"enc,omitempty"`
+	TotalBytes   int64               `json:"total_bytes,omitempty"`
+	ChunkCount   uint64              `json:"chunk_count,omitempty"`
+	SHA256Hex    string              `json:"sha256,omitempty"`
 }
 
 type Manifest struct {
@@ -52,6 +58,23 @@ type Manifest struct {
 	TotalBytes int64
 	ChunkCount uint64
 	SHA256Hex  string
+}
+
+type Ack struct {
+	TransferID   string
+	NextSequence uint64
+	NextOffset   int64
+}
+
+type ResumeManifest struct {
+	TransferID   string
+	NextSequence uint64
+	NextOffset   int64
+	TotalBytes   int64
+	// SHA256Hex is the digest of the durable plaintext prefix through NextOffset.
+	// It is intentionally distinct from Manifest.SHA256Hex, which is the final
+	// complete-file digest.
+	SHA256Hex string
 }
 
 type Progress struct {
@@ -73,6 +96,14 @@ func EncodeFrame(frame Frame) ([]byte, error) {
 
 func EncodeManifestFrame(manifest Manifest) ([]byte, error) {
 	return EncodeFrame(Frame{Version: ProtocolVersion, Type: FrameTypeManifest, TransferID: manifest.TransferID, TotalBytes: manifest.TotalBytes, ChunkCount: manifest.ChunkCount, SHA256Hex: manifest.SHA256Hex})
+}
+
+func EncodeAckFrame(ack Ack) ([]byte, error) {
+	return EncodeFrame(Frame{Version: ProtocolVersion, Type: FrameTypeAck, TransferID: ack.TransferID, NextSequence: ack.NextSequence, NextOffset: ack.NextOffset})
+}
+
+func EncodeResumeManifestFrame(resume ResumeManifest) ([]byte, error) {
+	return EncodeFrame(Frame{Version: ProtocolVersion, Type: FrameTypeResumeManifest, TransferID: resume.TransferID, NextSequence: resume.NextSequence, NextOffset: resume.NextOffset, TotalBytes: resume.TotalBytes, SHA256Hex: resume.SHA256Hex})
 }
 
 func DecodeFrame(encoded []byte) (Frame, error) {
@@ -119,6 +150,27 @@ func validateFrame(frame Frame) error {
 		}
 		if frame.ChunkCount == 0 && frame.TotalBytes > 0 {
 			return ErrInvalidChunkCount
+		}
+		if frame.SHA256Hex == "" {
+			return ErrSHA256Required
+		}
+		digest, err := hex.DecodeString(frame.SHA256Hex)
+		if err != nil || len(digest) != sha256.Size {
+			return ErrSHA256Required
+		}
+	case FrameTypeAck:
+		if frame.NextOffset < 0 {
+			return ErrNegativeNextOffset
+		}
+	case FrameTypeResumeManifest:
+		if frame.NextOffset < 0 {
+			return ErrNegativeNextOffset
+		}
+		if frame.TotalBytes < 0 {
+			return ErrNegativeTotalBytes
+		}
+		if frame.NextOffset > frame.TotalBytes {
+			return ErrResumePastTotalBytes
 		}
 		if frame.SHA256Hex == "" {
 			return ErrSHA256Required

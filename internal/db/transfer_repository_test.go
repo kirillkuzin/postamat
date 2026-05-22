@@ -48,7 +48,7 @@ func TestTransferRepositorySaveMapsOptionalEmptyFieldsToNull(t *testing.T) {
 	if err := repo.Save(context.Background(), session); err != nil {
 		t.Fatalf("Save returned error: %v", err)
 	}
-	for _, idx := range []int{5, 8, 9, 12, 13, 23} {
+	for _, idx := range []int{5, 8, 9, 12, 13, 24} {
 		if db.execArgs[idx] != nil {
 			t.Fatalf("arg %d = %#v, want SQL NULL", idx, db.execArgs[idx])
 		}
@@ -119,8 +119,45 @@ func TestTransferRepositoryUpdateLocksRowAndPersistsMutation(t *testing.T) {
 	}
 }
 
+func TestTransferRepositoryPersistsInterruptedRetryableState(t *testing.T) {
+	session := sampleTransferSession()
+	session.Status = sessions.StatusTransferring
+	session.CompletedAt = nil
+	db := &fakeTransferDB{row: fakeRow{values: sessionRowValues(session)}}
+	repo := NewTransferRepository(db)
+
+	interrupted, err := repo.Update(context.Background(), session.ID, func(s *sessions.TransferSession) error {
+		return s.MarkInterrupted("network dropped", session.CreatedAt.Add(time.Minute))
+	})
+	if err != nil {
+		t.Fatalf("Update MarkInterrupted returned error: %v", err)
+	}
+	if interrupted.Status != sessions.StatusInterrupted || interrupted.InterruptedAt == nil {
+		t.Fatalf("interrupted session = %+v", interrupted)
+	}
+	if got := db.tx.execArgs[20]; got != interrupted.InterruptedAt {
+		t.Fatalf("interrupted_at exec arg = %#v, want %#v", got, interrupted.InterruptedAt)
+	}
+	if !containsAll(db.tx.execSQL, "interrupted_at", "status = EXCLUDED.status") {
+		t.Fatalf("upsert SQL does not persist interrupted fields: %s", db.tx.execSQL)
+	}
+
+	db = &fakeTransferDB{row: fakeRow{values: sessionRowValues(interrupted)}}
+	repo = NewTransferRepository(db)
+	retryable, err := repo.Update(context.Background(), session.ID, func(s *sessions.TransferSession) error {
+		return s.MarkRetryable()
+	})
+	if err != nil {
+		t.Fatalf("Update MarkRetryable returned error: %v", err)
+	}
+	if retryable.Status != sessions.StatusRetryable || retryable.InterruptedAt == nil {
+		t.Fatalf("retryable session = %+v", retryable)
+	}
+}
+
 func sampleTransferSession() sessions.TransferSession {
 	completedAt := time.Date(2026, 5, 20, 12, 10, 0, 0, time.UTC)
+	interruptedAt := time.Date(2026, 5, 20, 12, 15, 0, 0, time.UTC)
 	failedAt := time.Date(2026, 5, 20, 12, 20, 0, 0, time.UTC)
 	cancelledAt := time.Date(2026, 5, 20, 12, 30, 0, 0, time.UTC)
 	expiredAt := time.Date(2026, 5, 20, 12, 40, 0, 0, time.UTC)
@@ -147,6 +184,7 @@ func sampleTransferSession() sessions.TransferSession {
 		PasswordHash:            &passwordHash,
 		CreatedAt:               time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC),
 		CompletedAt:             &completedAt,
+		InterruptedAt:           &interruptedAt,
 		FailedAt:                &failedAt,
 		CancelledAt:             &cancelledAt,
 		ExpiredAt:               &expiredAt,
@@ -155,7 +193,7 @@ func sampleTransferSession() sessions.TransferSession {
 }
 
 func sessionRowValues(s sessions.TransferSession) []any {
-	return []any{s.ID, s.Transport, s.Target, s.Status, s.FromAgentID, sqlString(s.ToAgentID), sqlString(s.PublicTokenHash), s.AgentTicketHash, sqlString(s.ReceiverTicketHash), s.ReceiverTicketExpiresAt, s.FileName, s.FileSizeBytes, sqlString(s.FileSHA256), sqlString(s.MimeType), s.ExpiresAt, s.MaxDownloads, s.DownloadCount, s.PasswordHash, s.CreatedAt, s.CompletedAt, s.FailedAt, s.CancelledAt, s.ExpiredAt, sqlString(s.FailureReason)}
+	return []any{s.ID, s.Transport, s.Target, s.Status, s.FromAgentID, sqlString(s.ToAgentID), sqlString(s.PublicTokenHash), s.AgentTicketHash, sqlString(s.ReceiverTicketHash), s.ReceiverTicketExpiresAt, s.FileName, s.FileSizeBytes, sqlString(s.FileSHA256), sqlString(s.MimeType), s.ExpiresAt, s.MaxDownloads, s.DownloadCount, s.PasswordHash, s.CreatedAt, s.CompletedAt, s.InterruptedAt, s.FailedAt, s.CancelledAt, s.ExpiredAt, sqlString(s.FailureReason)}
 }
 
 func sqlString(value string) sql.NullString {
