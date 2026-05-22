@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -165,6 +167,289 @@ func TestBackendLoopLiveTwoAgentWebRTCRuntimeTransfersInboxFile(t *testing.T) {
 	}
 	if finalReceive.Status != JobStatusCompleted || finalReceive.ProgressBytes != int64(len(payload)) {
 		t.Fatalf("receive job not completed with full progress: %+v", finalReceive)
+	}
+}
+
+func TestLiveSenderResumeManifestUsesRetryableProgress(t *testing.T) {
+	payload := []byte("chunk-0000|chunk-0001|chunk-0002")
+	sourcePath := filepath.Join(t.TempDir(), "payload.txt")
+	if err := os.WriteFile(sourcePath, payload, 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		t.Fatalf("open source: %v", err)
+	}
+	defer source.Close()
+	jobs := NewJobManager(nil)
+	job := retryableSendJobForTest(t, jobs, sourcePath, "tr_live_resume", int64(len(payload)), 11)
+
+	resume, err := liveSenderResumeManifest(source, job, 11)
+	if err != nil {
+		t.Fatalf("liveSenderResumeManifest: %v", err)
+	}
+	if resume == nil {
+		t.Fatal("expected resume manifest for retryable sender progress")
+	}
+	if resume.TransferID != "tr_live_resume" || resume.NextOffset != 11 || resume.NextSequence != 1 || resume.TotalBytes != int64(len(payload)) {
+		t.Fatalf("resume = %+v", *resume)
+	}
+	wantDigest := sha256HexForTest(payload[:11])
+	if resume.SHA256Hex != wantDigest {
+		t.Fatalf("resume digest = %s, want %s", resume.SHA256Hex, wantDigest)
+	}
+	pos, err := source.Seek(0, io.SeekCurrent)
+	if err != nil {
+		t.Fatalf("source seek current: %v", err)
+	}
+	if pos != 0 {
+		t.Fatalf("source position = %d, want reset to 0 before StreamReader", pos)
+	}
+}
+
+func TestLiveSenderResumeManifestReturnsNilWithoutRetryableProgress(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "payload.txt")
+	if err := os.WriteFile(sourcePath, []byte("payload"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		t.Fatalf("open source: %v", err)
+	}
+	defer source.Close()
+	jobs := NewJobManager(nil)
+	job := acceptedSendJobForTest(t, jobs, sourcePath, "tr_no_resume", 7)
+	resume, err := liveSenderResumeManifest(source, job, 64*1024)
+	if err != nil {
+		t.Fatalf("liveSenderResumeManifest: %v", err)
+	}
+	if resume != nil {
+		t.Fatalf("resume = %+v, want nil", *resume)
+	}
+}
+
+func TestBackendLoopMarkTransferStartedRestartsRetryableJob(t *testing.T) {
+	jobs := NewJobManager(nil)
+	sourcePath := filepath.Join(t.TempDir(), "payload.txt")
+	if err := os.WriteFile(sourcePath, []byte("payload"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	job := retryableSendJobForTest(t, jobs, sourcePath, "tr_restart", 7, 3)
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-a", DeviceID: "dev-a", Jobs: jobs})
+	if err := loop.markTransferStarted("tr_restart"); err != nil {
+		t.Fatalf("markTransferStarted retryable: %v", err)
+	}
+	final, ok := jobs.FindByTransferID(job.TransferID)
+	if !ok {
+		t.Fatal("missing job")
+	}
+	if final.Status != JobStatusTransferring {
+		t.Fatalf("status = %s, want transferring", final.Status)
+	}
+	if final.ProgressBytes != 3 {
+		t.Fatalf("progress = %d, want preserved retry offset 3", final.ProgressBytes)
+	}
+}
+
+func TestRetryableRuntimeErrorIncludesPreOpenDataChannelClose(t *testing.T) {
+	err := fmt.Errorf("%w: data channel closed before open", p2p.ErrTransferFailed)
+	if !isRetryableRuntimeError(err) {
+		t.Fatalf("expected pre-open data channel close to be retryable: %v", err)
+	}
+}
+
+func TestBackendLoopRunTransferReturnsAfterRemoteRetryable(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		conn, err := upgrader.Upgrade(w, req, nil)
+		if err != nil {
+			t.Fatalf("upgrade: %v", err)
+		}
+		defer conn.Close()
+		var hello signaling.Envelope
+		if err := conn.ReadJSON(&hello); err != nil {
+			t.Fatalf("read hello: %v", err)
+		}
+		var offer signaling.Envelope
+		if err := conn.ReadJSON(&offer); err != nil {
+			t.Fatalf("read offer: %v", err)
+		}
+		if offer.Type != signaling.MessageTransferOffer {
+			t.Fatalf("unexpected offer: %+v", offer)
+		}
+		payload, err := json.Marshal(map[string]int64{"progress_bytes": 0})
+		if err != nil {
+			t.Fatalf("marshal retryable payload: %v", err)
+		}
+		if err := conn.WriteJSON(signaling.Envelope{Type: signaling.MessageTransferRetryable, TransferID: offer.TransferID, FromAgentID: "agent-b", ToAgentID: "agent-a", Payload: payload}); err != nil {
+			t.Fatalf("write retryable: %v", err)
+		}
+		<-req.Context().Done()
+	}))
+	defer server.Close()
+
+	jobs := NewJobManager(nil)
+	sourcePath := filepath.Join(t.TempDir(), "payload.txt")
+	if err := os.WriteFile(sourcePath, []byte("payload"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	job := acceptedSendJobForTest(t, jobs, sourcePath, "tr_run_retryable", 7)
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-a", DeviceID: "dev-a", Jobs: jobs, Client: NewBackendClient(server.URL, server.Client())})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := loop.RunTransfer(ctx, job)
+	if !errors.Is(err, p2p.ErrTransferFailed) {
+		t.Fatalf("RunTransfer error = %v, want ErrTransferFailed", err)
+	}
+	final, ok := jobs.FindByTransferID(job.TransferID)
+	if !ok {
+		t.Fatal("missing job")
+	}
+	if final.Status != JobStatusRetryable {
+		t.Fatalf("job status = %s, want retryable", final.Status)
+	}
+}
+
+func TestBackendLoopMarksAcceptedLiveTransferRetryableFromRemoteState(t *testing.T) {
+	jobs := NewJobManager(nil)
+	sourcePath := filepath.Join(t.TempDir(), "payload.txt")
+	if err := os.WriteFile(sourcePath, []byte("payload"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	job := acceptedSendJobForTest(t, jobs, sourcePath, "tr_accepted_retry", 7)
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-a", DeviceID: "dev-a", Jobs: jobs})
+
+	envelope := signaling.Envelope{Type: signaling.MessageTransferRetryable, TransferID: job.TransferID, FromAgentID: "agent-b", ToAgentID: "agent-a"}
+	if err := loop.HandleEnvelope(context.Background(), envelope); err != nil {
+		t.Fatalf("HandleEnvelope retryable: %v", err)
+	}
+	final, ok := jobs.FindByTransferID(job.TransferID)
+	if !ok {
+		t.Fatal("missing job")
+	}
+	if final.Status != JobStatusRetryable || final.ProgressBytes != 0 {
+		t.Fatalf("job = %+v, want retryable at zero progress", final)
+	}
+}
+
+func TestBackendLoopUsesRemoteRetryableProgressForSenderResumeOffset(t *testing.T) {
+	jobs := NewJobManager(nil)
+	sourcePath := filepath.Join(t.TempDir(), "payload.txt")
+	if err := os.WriteFile(sourcePath, []byte("0123456789"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	job := acceptedSendJobForTest(t, jobs, sourcePath, "tr_progress_retry", 10)
+	job, err := jobs.MarkConnecting(job.ID)
+	if err != nil {
+		t.Fatalf("MarkConnecting: %v", err)
+	}
+	job, err = jobs.MarkTransferring(job.ID)
+	if err != nil {
+		t.Fatalf("MarkTransferring: %v", err)
+	}
+	if _, err := jobs.UpdateProgress(job.ID, 9); err != nil {
+		t.Fatalf("UpdateProgress: %v", err)
+	}
+	payload, err := json.Marshal(map[string]int64{"progress_bytes": 4})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-a", DeviceID: "dev-a", Jobs: jobs})
+
+	envelope := signaling.Envelope{Type: signaling.MessageTransferRetryable, TransferID: job.TransferID, FromAgentID: "agent-b", ToAgentID: "agent-a", Payload: payload}
+	if err := loop.HandleEnvelope(context.Background(), envelope); err != nil {
+		t.Fatalf("HandleEnvelope retryable: %v", err)
+	}
+	final, ok := jobs.FindByTransferID(job.TransferID)
+	if !ok {
+		t.Fatal("missing job")
+	}
+	if final.Status != JobStatusRetryable || final.ProgressBytes != 4 {
+		t.Fatalf("job = %+v, want retryable at receiver durable offset 4", final)
+	}
+}
+
+func TestLiveReceiverPartialPreparationDiscardsStalePartialForFreshAcceptedJob(t *testing.T) {
+	destinationPath := filepath.Join(t.TempDir(), "payload.txt")
+	partialPath := destinationPath + ".part"
+	if err := os.WriteFile(partialPath, []byte("stale"), 0o600); err != nil {
+		t.Fatalf("write stale partial: %v", err)
+	}
+	jobs := NewJobManager(nil)
+	job := acceptedReceiveJobForTest(t, jobs, destinationPath, "tr_stale", 10)
+
+	_, resumed, _, err := prepareLiveReceiverPartial(partialPath, job)
+	if err != nil {
+		t.Fatalf("prepareLiveReceiverPartial: %v", err)
+	}
+	if resumed {
+		t.Fatal("fresh accepted job must not resume from stale .part")
+	}
+	if _, err := os.Lstat(partialPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale partial should be discarded before fresh receive, lstat err=%v", err)
+	}
+}
+
+func TestBackendLoopMarksLiveTransferRetryableFromRemoteState(t *testing.T) {
+	jobs := NewJobManager(nil)
+	sourcePath := filepath.Join(t.TempDir(), "payload.txt")
+	if err := os.WriteFile(sourcePath, []byte("payload"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	job := retryableSendJobForTest(t, jobs, sourcePath, "tr_remote_retry", 7, 3)
+	// Put the job back into an active state to prove the incoming remote retryable
+	// signal, not the fixture, performs the transition under test.
+	job, err := jobs.MarkConnecting(job.ID)
+	if err != nil {
+		t.Fatalf("MarkConnecting: %v", err)
+	}
+	job, err = jobs.MarkTransferring(job.ID)
+	if err != nil {
+		t.Fatalf("MarkTransferring: %v", err)
+	}
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-a", DeviceID: "dev-a", Jobs: jobs})
+
+	envelope := signaling.Envelope{Type: signaling.MessageTransferRetryable, TransferID: "tr_remote_retry", FromAgentID: "agent-b", ToAgentID: "agent-a"}
+	if err := loop.HandleEnvelope(context.Background(), envelope); err != nil {
+		t.Fatalf("HandleEnvelope retryable: %v", err)
+	}
+	final, ok := jobs.FindByTransferID("tr_remote_retry")
+	if !ok {
+		t.Fatal("missing job")
+	}
+	if final.Status != JobStatusRetryable {
+		t.Fatalf("job status = %s, want retryable", final.Status)
+	}
+}
+
+func TestBackendLoopMarksLiveTransferInterruptedFromRemoteState(t *testing.T) {
+	jobs := NewJobManager(nil)
+	destinationPath := filepath.Join(t.TempDir(), "payload.txt")
+	job := acceptedReceiveJobForTest(t, jobs, destinationPath, "tr_remote_interrupt", 7)
+	job, err := jobs.MarkConnecting(job.ID)
+	if err != nil {
+		t.Fatalf("MarkConnecting: %v", err)
+	}
+	job, err = jobs.MarkTransferring(job.ID)
+	if err != nil {
+		t.Fatalf("MarkTransferring: %v", err)
+	}
+	if _, err := jobs.UpdateProgress(job.ID, 3); err != nil {
+		t.Fatalf("UpdateProgress: %v", err)
+	}
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-b", Jobs: jobs})
+
+	envelope := signaling.Envelope{Type: signaling.MessageTransferInterrupted, TransferID: "tr_remote_interrupt", FromAgentID: "agent-a", ToAgentID: "agent-b"}
+	if err := loop.HandleEnvelope(context.Background(), envelope); err != nil {
+		t.Fatalf("HandleEnvelope interrupted: %v", err)
+	}
+	final, ok := jobs.FindByTransferID("tr_remote_interrupt")
+	if !ok {
+		t.Fatal("missing job")
+	}
+	if final.Status != JobStatusRetryable {
+		t.Fatalf("job status = %s, want retryable", final.Status)
 	}
 }
 
