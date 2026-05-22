@@ -58,3 +58,6 @@ jobs:
 
       - name: Build Go commands
         run: go build ./cmd/server ./cmd/agentd ./cmd/postamat
+
+      - name: Smoke-check Compose deployment config
+        run: docker compose --env-file deployments/.env.example -f deployments/compose.yaml config

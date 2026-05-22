@@ -51,6 +51,7 @@ func TestMakeVerifyBuildsFrontendBeforeGoChecks(t *testing.T) {
 		"go tool cover -func=coverage.out | tee coverage.txt",
 		"go vet ./...",
 		"go build ./cmd/server ./cmd/agentd ./cmd/postamat",
+		"docker compose --env-file deployments/.env.example -f deployments/compose.yaml config",
 	)
 }
 
@@ -86,6 +87,7 @@ func TestGitHubActionsBuildsFrontendBeforeGoChecks(t *testing.T) {
 		"go tool cover -func=coverage.out | tee coverage.txt",
 		"go vet ./...",
 		"go build ./cmd/server ./cmd/agentd ./cmd/postamat",
+		"docker compose --env-file deployments/.env.example -f deployments/compose.yaml config",
 	)
 }
 
