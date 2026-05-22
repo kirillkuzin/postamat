@@ -122,6 +122,62 @@ func TestTransferSessionCanFailFromConnectingOrTransferring(t *testing.T) {
 	}
 }
 
+func TestTransferSessionInterruptedCanBecomeRetryableAndReconnect(t *testing.T) {
+	transfer := mustNewTransferIntent(t)
+	if err := transfer.MarkOffered(); err != nil {
+		t.Fatalf("MarkOffered returned error: %v", err)
+	}
+	if err := transfer.MarkAccepted(); err != nil {
+		t.Fatalf("MarkAccepted returned error: %v", err)
+	}
+	if err := transfer.MarkConnecting(); err != nil {
+		t.Fatalf("MarkConnecting returned error: %v", err)
+	}
+	if err := transfer.MarkTransferStarted(); err != nil {
+		t.Fatalf("MarkTransferStarted returned error: %v", err)
+	}
+
+	interruptedAt := time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC)
+	if err := transfer.MarkInterrupted("network dropped", interruptedAt); err != nil {
+		t.Fatalf("MarkInterrupted returned error: %v", err)
+	}
+	if transfer.Status != sessions.StatusInterrupted || transfer.InterruptedAt == nil || transfer.FailureReason != "network dropped" || transfer.IsTerminal() {
+		t.Fatalf("interrupted transfer state = %+v", transfer)
+	}
+
+	if err := transfer.MarkRetryable(); err != nil {
+		t.Fatalf("MarkRetryable returned error: %v", err)
+	}
+	if transfer.Status != sessions.StatusRetryable || transfer.IsTerminal() {
+		t.Fatalf("retryable transfer state = %+v", transfer)
+	}
+	if err := transfer.MarkConnecting(); err != nil {
+		t.Fatalf("retryable transfer did not reconnect: %v", err)
+	}
+	if transfer.Status != sessions.StatusConnecting {
+		t.Fatalf("status after retry connect = %q, want %q", transfer.Status, sessions.StatusConnecting)
+	}
+}
+
+func TestTransferSessionRejectsInvalidInterruptedRetryableTransitions(t *testing.T) {
+	transfer := mustNewTransferIntent(t)
+	if err := transfer.MarkInterrupted("", time.Now()); !errors.Is(err, sessions.ErrFailureReasonRequired) {
+		t.Fatalf("MarkInterrupted empty reason error = %v, want ErrFailureReasonRequired", err)
+	}
+	if err := transfer.MarkInterrupted("too early", time.Now()); !errors.Is(err, sessions.ErrInvalidStatusTransition) {
+		t.Fatalf("MarkInterrupted created transfer error = %v, want ErrInvalidStatusTransition", err)
+	}
+	if err := transfer.MarkRetryable(); !errors.Is(err, sessions.ErrInvalidStatusTransition) {
+		t.Fatalf("MarkRetryable created transfer error = %v, want ErrInvalidStatusTransition", err)
+	}
+	if err := transfer.Cancel(time.Now()); err != nil {
+		t.Fatalf("Cancel returned error: %v", err)
+	}
+	if err := transfer.MarkInterrupted("terminal", time.Now()); !errors.Is(err, sessions.ErrTerminalSession) {
+		t.Fatalf("MarkInterrupted terminal transfer error = %v, want ErrTerminalSession", err)
+	}
+}
+
 func TestTransferSessionCancelAndExpireMoveNonTerminalSessionToTerminalState(t *testing.T) {
 	cancelled := mustNewTransferIntent(t)
 	cancelledAt := time.Date(2026, 5, 19, 12, 10, 0, 0, time.UTC)

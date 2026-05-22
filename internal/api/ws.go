@@ -233,7 +233,7 @@ func authorizeTransferRole(messageType signaling.MessageType, fromSender bool) e
 		if !fromSender {
 			return nil
 		}
-	case signaling.MessageWebRTCICE, signaling.MessageTransferStarted, signaling.MessageTransferProgress, signaling.MessageTransferFailed, signaling.MessageTransferCancelled, signaling.MessageTransferExpired:
+	case signaling.MessageWebRTCICE, signaling.MessageTransferStarted, signaling.MessageTransferProgress, signaling.MessageTransferInterrupted, signaling.MessageTransferRetryable, signaling.MessageTransferFailed, signaling.MessageTransferCancelled, signaling.MessageTransferExpired:
 		return nil
 	case signaling.MessageTransferCompleted:
 		if !fromSender {

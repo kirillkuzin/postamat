@@ -21,9 +21,15 @@ func TestDecodeEnvelopeRequiresAgentForHello(t *testing.T) {
 }
 
 func TestDecodeEnvelopeRequiresTransferForTransferMessages(t *testing.T) {
-	_, err := DecodeEnvelope([]byte(`{"type":"transfer.accepted","agent_id":"agent_b"}`))
-	if !errors.Is(err, ErrTransferIDRequired) {
-		t.Fatalf("expected ErrTransferIDRequired, got %v", err)
+	for _, messageType := range []MessageType{MessageTransferAccepted, MessageTransferInterrupted, MessageTransferRetryable} {
+		raw, err := json.Marshal(Envelope{Type: messageType, AgentID: "agent_b"})
+		if err != nil {
+			t.Fatalf("marshal envelope: %v", err)
+		}
+		_, err = DecodeEnvelope(raw)
+		if !errors.Is(err, ErrTransferIDRequired) {
+			t.Fatalf("%s expected ErrTransferIDRequired, got %v", messageType, err)
+		}
 	}
 }
 

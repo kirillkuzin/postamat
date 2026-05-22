@@ -193,6 +193,46 @@ func TestServiceCanMarkFailedAndExpired(t *testing.T) {
 	}
 }
 
+func TestServiceCanMarkInterruptedAndRetryable(t *testing.T) {
+	repo := sessions.NewMemoryRepository()
+	service := sessions.NewService(repo, &fakeTokenIssuer{}, func() time.Time {
+		return time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC)
+	})
+	created, err := service.CreateTransfer(context.Background(), validTransferInput(nil))
+	if err != nil {
+		t.Fatalf("CreateTransfer returned error: %v", err)
+	}
+	if _, err := repo.Update(context.Background(), created.Transfer.ID, func(session *sessions.TransferSession) error {
+		if err := session.MarkOffered(); err != nil {
+			return err
+		}
+		if err := session.MarkAccepted(); err != nil {
+			return err
+		}
+		if err := session.MarkConnecting(); err != nil {
+			return err
+		}
+		return session.MarkTransferStarted()
+	}); err != nil {
+		t.Fatalf("advance transfer: %v", err)
+	}
+
+	interrupted, err := service.MarkInterrupted(context.Background(), created.Transfer.ID, "network dropped")
+	if err != nil {
+		t.Fatalf("MarkInterrupted returned error: %v", err)
+	}
+	if interrupted.Status != sessions.StatusInterrupted || interrupted.InterruptedAt == nil || interrupted.IsTerminal() {
+		t.Fatalf("interrupted transfer = %+v", interrupted)
+	}
+	retryable, err := service.MarkRetryable(context.Background(), created.Transfer.ID)
+	if err != nil {
+		t.Fatalf("MarkRetryable returned error: %v", err)
+	}
+	if retryable.Status != sessions.StatusRetryable || retryable.IsTerminal() {
+		t.Fatalf("retryable transfer = %+v", retryable)
+	}
+}
+
 func TestServiceIssuesAndVerifiesBrowserReceiverTicketAfterConsent(t *testing.T) {
 	now := time.Date(2026, 5, 19, 12, 10, 0, 0, time.UTC)
 	service := sessions.NewService(sessions.NewMemoryRepository(), sessions.RandomTokenIssuer{Pepper: "test-pepper"}, func() time.Time { return now })

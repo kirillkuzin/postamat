@@ -49,6 +49,38 @@ func TestManifestFrameCarriesFinalHashAndChunkCount(t *testing.T) {
 	}
 }
 
+func TestAckFrameRoundTripCarriesNextResumePoint(t *testing.T) {
+	ack := Ack{TransferID: "tr_123", NextSequence: 3, NextOffset: 196608}
+	encoded, err := EncodeAckFrame(ack)
+	if err != nil {
+		t.Fatalf("encode ack: %v", err)
+	}
+	decoded, err := DecodeFrame(encoded)
+	if err != nil {
+		t.Fatalf("decode ack: %v", err)
+	}
+
+	if decoded.Type != FrameTypeAck || decoded.TransferID != ack.TransferID || decoded.NextSequence != ack.NextSequence || decoded.NextOffset != ack.NextOffset {
+		t.Fatalf("unexpected ack frame: %#v", decoded)
+	}
+}
+
+func TestResumeManifestFrameRoundTripCarriesDurableResumePoint(t *testing.T) {
+	resume := ResumeManifest{TransferID: "tr_123", NextSequence: 8, NextOffset: 524288, TotalBytes: 1048576, SHA256Hex: "b94d27b9934d3e08a52e52d7da7dabfadeb6d4141e61ab56f07dbb4255f47c5b"}
+	encoded, err := EncodeResumeManifestFrame(resume)
+	if err != nil {
+		t.Fatalf("encode resume manifest: %v", err)
+	}
+	decoded, err := DecodeFrame(encoded)
+	if err != nil {
+		t.Fatalf("decode resume manifest: %v", err)
+	}
+
+	if decoded.Type != FrameTypeResumeManifest || decoded.TransferID != resume.TransferID || decoded.NextSequence != resume.NextSequence || decoded.NextOffset != resume.NextOffset || decoded.TotalBytes != resume.TotalBytes || decoded.SHA256Hex != resume.SHA256Hex {
+		t.Fatalf("unexpected resume manifest frame: %#v", decoded)
+	}
+}
+
 func TestManifestFrameRequiresFullSHA256Digest(t *testing.T) {
 	_, err := EncodeManifestFrame(Manifest{TransferID: "tr_123", TotalBytes: 5, ChunkCount: 1, SHA256Hex: "0000"})
 	if !errors.Is(err, ErrSHA256Required) {
@@ -75,6 +107,12 @@ func TestDecodeRejectsMalformedChunkFrames(t *testing.T) {
 		{name: "missing chunk data", frame: Frame{Version: ProtocolVersion, Type: FrameTypeChunk, TransferID: "tr_123"}, want: ErrChunkDataRequired},
 		{name: "negative offset", frame: Frame{Version: ProtocolVersion, Type: FrameTypeChunk, TransferID: "tr_123", Offset: -1, Data: []byte("x")}, want: ErrNegativeOffset},
 		{name: "unsupported version", frame: Frame{Version: 99, Type: FrameTypeChunk, TransferID: "tr_123", Data: []byte("x")}, want: ErrUnsupportedProtocolVersion},
+		{name: "ack missing transfer", frame: Frame{Version: ProtocolVersion, Type: FrameTypeAck, NextSequence: 1, NextOffset: 1}, want: ErrTransferIDRequired},
+		{name: "ack negative next offset", frame: Frame{Version: ProtocolVersion, Type: FrameTypeAck, TransferID: "tr_123", NextSequence: 1, NextOffset: -1}, want: ErrNegativeNextOffset},
+		{name: "resume missing transfer", frame: Frame{Version: ProtocolVersion, Type: FrameTypeResumeManifest, NextOffset: 1, TotalBytes: 2, SHA256Hex: "0000000000000000000000000000000000000000000000000000000000000000"}, want: ErrTransferIDRequired},
+		{name: "resume past total", frame: Frame{Version: ProtocolVersion, Type: FrameTypeResumeManifest, TransferID: "tr_123", NextOffset: 3, TotalBytes: 2, SHA256Hex: "0000000000000000000000000000000000000000000000000000000000000000"}, want: ErrResumePastTotalBytes},
+		{name: "resume negative total", frame: Frame{Version: ProtocolVersion, Type: FrameTypeResumeManifest, TransferID: "tr_123", NextOffset: 0, TotalBytes: -1, SHA256Hex: "0000000000000000000000000000000000000000000000000000000000000000"}, want: ErrNegativeTotalBytes},
+		{name: "resume invalid sha", frame: Frame{Version: ProtocolVersion, Type: FrameTypeResumeManifest, TransferID: "tr_123", NextOffset: 0, TotalBytes: 2, SHA256Hex: "0000"}, want: ErrSHA256Required},
 	}
 
 	for _, tc := range cases {
@@ -88,6 +126,30 @@ func TestDecodeRejectsMalformedChunkFrames(t *testing.T) {
 				t.Fatalf("DecodeFrame error = %v, want %v", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestReceiverExportsAckAndResumeManifestAfterAcceptedChunks(t *testing.T) {
+	dc := newFakeDataChannel()
+	if _, err := StreamReader(context.Background(), "tr_123", bytes.NewBufferString("hello world"), dc, SenderOptions{ChunkSize: 5, AllowPlaintext: true}); err != nil {
+		t.Fatalf("stream reader: %v", err)
+	}
+
+	var out bytes.Buffer
+	receiver := NewReceiver("tr_123", &out, ReceiverOptions{AllowPlaintext: true})
+	for _, msg := range dc.sent[:2] {
+		if _, err := receiver.Accept(msg); err != nil {
+			t.Fatalf("receiver accept: %v", err)
+		}
+	}
+
+	ack := receiver.Ack()
+	if ack.TransferID != "tr_123" || ack.NextSequence != 2 || ack.NextOffset != 10 {
+		t.Fatalf("receiver ack = %#v", ack)
+	}
+	resume := receiver.ResumeManifest(11)
+	if resume.TransferID != "tr_123" || resume.NextSequence != 2 || resume.NextOffset != 10 || resume.TotalBytes != 11 || resume.SHA256Hex == "" {
+		t.Fatalf("receiver resume manifest = %#v", resume)
 	}
 }
 

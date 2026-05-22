@@ -17,6 +17,8 @@ const (
 	StatusAccepted     = "accepted"
 	StatusConnecting   = "connecting"
 	StatusTransferring = "transferring"
+	StatusInterrupted  = "interrupted"
+	StatusRetryable    = "retryable"
 	StatusCompleted    = "completed"
 	StatusFailed       = "failed"
 	StatusCancelled    = "cancelled"
@@ -79,6 +81,7 @@ type TransferSession struct {
 
 	CreatedAt     time.Time
 	CompletedAt   *time.Time
+	InterruptedAt *time.Time
 	FailedAt      *time.Time
 	CancelledAt   *time.Time
 	ExpiredAt     *time.Time
@@ -154,6 +157,9 @@ func (s *TransferSession) MarkAccepted() error {
 }
 
 func (s *TransferSession) MarkConnecting() error {
+	if s.Status == StatusRetryable {
+		return s.transition(StatusRetryable, StatusConnecting)
+	}
 	return s.transition(StatusAccepted, StatusConnecting)
 }
 
@@ -168,6 +174,26 @@ func (s *TransferSession) MarkCompleted(at time.Time) error {
 	s.DownloadCount++
 	s.CompletedAt = cloneTime(at)
 	return nil
+}
+
+func (s *TransferSession) MarkInterrupted(reason string, at time.Time) error {
+	if s.IsTerminal() {
+		return ErrTerminalSession
+	}
+	if reason == "" {
+		return ErrFailureReasonRequired
+	}
+	if s.Status != StatusConnecting && s.Status != StatusTransferring {
+		return fmt.Errorf("%w: %s to %s", ErrInvalidStatusTransition, s.Status, StatusInterrupted)
+	}
+	s.Status = StatusInterrupted
+	s.FailureReason = reason
+	s.InterruptedAt = cloneTime(at)
+	return nil
+}
+
+func (s *TransferSession) MarkRetryable() error {
+	return s.transition(StatusInterrupted, StatusRetryable)
 }
 
 func (s *TransferSession) MarkFailed(reason string, at time.Time) error {
@@ -228,6 +254,10 @@ func cloneSession(session TransferSession) TransferSession {
 	if session.CompletedAt != nil {
 		completedAt := *session.CompletedAt
 		session.CompletedAt = &completedAt
+	}
+	if session.InterruptedAt != nil {
+		interruptedAt := *session.InterruptedAt
+		session.InterruptedAt = &interruptedAt
 	}
 	if session.FailedAt != nil {
 		failedAt := *session.FailedAt
