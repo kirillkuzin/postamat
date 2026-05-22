@@ -58,6 +58,8 @@ type Job struct {
 	Status          JobStatus       `json:"status"`
 	TransferID      string          `json:"transfer_id,omitempty"`
 	AgentTicket     string          `json:"-"`
+	PublicToken     string          `json:"public_token,omitempty"`
+	BrowserURL      string          `json:"browser_url,omitempty"`
 	TransferKey     p2p.TransferKey `json:"-"`
 	HasTransferKey  bool            `json:"-"`
 	SourcePath      string          `json:"source_path,omitempty"`
@@ -187,6 +189,18 @@ func (m *JobManager) AttachTransfer(jobID string, transferID string, agentTicket
 		job.UpdatedAt = now
 		return nil
 	}, JobEvent{Type: JobEventTransferBound, TransferID: transferID})
+}
+
+func (m *JobManager) AttachPublicLink(jobID string, publicToken string, browserURL string) (Job, error) {
+	return m.update(jobID, func(job *Job, now time.Time) error {
+		if job.isTerminal() {
+			return ErrJobTerminal
+		}
+		job.PublicToken = publicToken
+		job.BrowserURL = browserURL
+		job.UpdatedAt = now
+		return nil
+	}, JobEvent{Type: JobEventTransferBound})
 }
 
 func (m *JobManager) AttachTransferKey(jobID string, key p2p.TransferKey) (Job, error) {

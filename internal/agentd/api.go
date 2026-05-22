@@ -28,6 +28,8 @@ type jobResponse struct {
 	Direction       string `json:"direction"`
 	Status          string `json:"status"`
 	TransferID      string `json:"transfer_id,omitempty"`
+	PublicToken     string `json:"public_token,omitempty"`
+	BrowserURL      string `json:"browser_url,omitempty"`
 	SourcePath      string `json:"source_path,omitempty"`
 	DestinationPath string `json:"destination_path,omitempty"`
 	FromAgentID     string `json:"from_agent_id,omitempty"`
@@ -107,7 +109,7 @@ func (r *LocalRouter) handleTransfers(w http.ResponseWriter, req *http.Request) 
 }
 
 func (r *LocalRouter) createSendJob(req *http.Request, input CreateSendJobInput) (Job, error) {
-	if r.backend != nil && !input.BrowserLink {
+	if r.backend != nil {
 		job, err := r.backend.CreateSendTransfer(req.Context(), input)
 		if err != nil {
 			return Job{}, err
@@ -230,7 +232,7 @@ func (r *LocalRouter) jobByIDOrTransferID(id string) (Job, error) {
 }
 
 func newJobResponse(job Job) jobResponse {
-	return jobResponse{ID: job.ID, Direction: string(job.Direction), Status: string(job.Status), TransferID: job.TransferID, SourcePath: job.SourcePath, DestinationPath: job.DestinationPath, FromAgentID: job.FromAgentID, ToAgentID: job.ToAgentID, BrowserLink: job.BrowserLink, FileName: job.FileName, FileSizeBytes: job.FileSizeBytes, ProgressBytes: job.ProgressBytes, FailureReason: job.FailureReason}
+	return jobResponse{ID: job.ID, Direction: string(job.Direction), Status: string(job.Status), TransferID: job.TransferID, PublicToken: job.PublicToken, BrowserURL: job.BrowserURL, SourcePath: job.SourcePath, DestinationPath: job.DestinationPath, FromAgentID: job.FromAgentID, ToAgentID: job.ToAgentID, BrowserLink: job.BrowserLink, FileName: job.FileName, FileSizeBytes: job.FileSizeBytes, ProgressBytes: job.ProgressBytes, FailureReason: job.FailureReason}
 }
 
 func statusForJobError(err error) int {

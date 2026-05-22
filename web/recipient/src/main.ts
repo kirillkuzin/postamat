@@ -30,11 +30,45 @@ type SignalingEnvelope = {
   payload?: unknown
 }
 
+type ChunkFrame = {
+  v: number
+  type: 'chunk'
+  transfer_id: string
+  seq?: number
+  offset?: number
+  data?: string
+  enc?: { alg: string; nonce: string }
+}
+
+type ManifestFrame = {
+  v: number
+  type: 'manifest'
+  transfer_id: string
+  total_bytes: number
+  chunk_count: number
+  sha256: string
+}
+
+type BrowserReceiveState = {
+  transfer: PublicTransfer
+  browserAgentID: string
+  peer?: RTCPeerConnection
+  channel?: RTCDataChannel
+  key: CryptoKey
+  chunks: Uint8Array<ArrayBuffer>[]
+  totalBytes: number
+  nextSeq: number
+  hasherReady: boolean
+  pendingICE: RTCIceCandidateInit[]
+  completed: boolean
+}
+
 const defaultBrowserAgentID = 'browser_recipient'
 const app = document.querySelector<HTMLDivElement>('#app')
 const token = readTokenFromPath()
 let socket: WebSocket | undefined
 let currentDeviceID = ''
+let receiveState: BrowserReceiveState | undefined
 
 function readTokenFromPath(): string {
   const raw = window.location.pathname.replace(/^\/p\//, '').split('/')[0] ?? ''
@@ -185,12 +219,22 @@ function connectReceiver(transfer: PublicTransfer, issued: ReceiverTicket) {
   socket = ws
 
   ws.addEventListener('open', () => {
-    sendEnvelope(ws, { type: 'agent.hello', agent_id: issued.browser_agent_id || defaultBrowserAgentID, device_id: currentDeviceID })
-    setStatus('Receiver signaling socket connected.')
-    logEvent('Sent browser receiver hello.')
+    void (async () => {
+      const browserAgentID = issued.browser_agent_id || defaultBrowserAgentID
+      sendEnvelope(ws, { type: 'agent.hello', agent_id: browserAgentID, device_id: currentDeviceID })
+      await prepareBrowserReceive(transfer, browserAgentID)
+      sendEnvelope(ws, {
+        type: 'transfer.accepted',
+        transfer_id: transfer.transfer_id,
+        from_agent_id: browserAgentID,
+        to_agent_id: transfer.from_agent_id,
+      })
+      setStatus('Receiver signaling socket connected.')
+      logEvent('Sent browser receiver hello and transfer acceptance.')
+    })()
   })
   ws.addEventListener('message', (event: MessageEvent<string>) => {
-    handleSignalingMessage(ws, transfer, issued.browser_agent_id || defaultBrowserAgentID, event.data)
+    void handleSignalingMessage(ws, transfer, issued.browser_agent_id || defaultBrowserAgentID, event.data)
   })
   ws.addEventListener('close', () => {
     setStatus('Receiver signaling socket closed.')
@@ -208,7 +252,7 @@ function receiverWebSocketURL(receiverTicket: string): string {
   return `${protocol}//${window.location.host}${path}?ticket=${encodeURIComponent(receiverTicket)}`
 }
 
-function handleSignalingMessage(ws: WebSocket, transfer: PublicTransfer, browserAgentID: string, raw: string) {
+async function handleSignalingMessage(ws: WebSocket, transfer: PublicTransfer, browserAgentID: string, raw: string) {
   let envelope: SignalingEnvelope
   try {
     envelope = JSON.parse(raw) as SignalingEnvelope
@@ -227,6 +271,7 @@ function handleSignalingMessage(ws: WebSocket, transfer: PublicTransfer, browser
         return
       }
       logEvent('Transfer offer received; accepting transfer.')
+      await prepareBrowserReceive(transfer, browserAgentID)
       sendEnvelope(ws, {
         type: 'transfer.accepted',
         transfer_id: transfer.transfer_id,
@@ -239,14 +284,32 @@ function handleSignalingMessage(ws: WebSocket, transfer: PublicTransfer, browser
         logEvent('Ignored WebRTC offer outside this transfer.')
         return
       }
-      logEvent('WebRTC offer received; browser data-channel receive is still under implementation.')
+      logEvent('WebRTC offer received; creating browser answer.')
+      await acceptWebRTCOffer(ws, transfer, browserAgentID, envelope.payload)
       break
     case 'webrtc.ice':
       if (!isExpectedSenderEnvelope(envelope, transfer, browserAgentID)) {
         logEvent('Ignored ICE candidate outside this transfer.')
         return
       }
-      logEvent('ICE candidate received for pending browser data-channel implementation.')
+      const state = receiveState
+      const candidate = envelope.payload as RTCIceCandidateInit
+      if (state?.peer) {
+        await state.peer.addIceCandidate(candidate)
+      } else if (state) {
+        state.pendingICE.push(candidate)
+      }
+      logEvent('ICE candidate accepted.')
+      break
+    case 'transfer.started':
+      logEvent('Transfer started.')
+      break
+    case 'transfer.progress':
+      logEvent(`Progress: ${JSON.stringify(envelope.payload ?? {})}`)
+      break
+    case 'transfer.completed':
+      setStatus('Transfer completed.')
+      logEvent('Transfer completed.')
       break
     case 'error':
       setStatus('Signaling error received.')
@@ -255,6 +318,185 @@ function handleSignalingMessage(ws: WebSocket, transfer: PublicTransfer, browser
     default:
       logEvent(`Received ${envelope.type}.`)
   }
+}
+
+function readBrowserTransferKey(): Uint8Array<ArrayBuffer> {
+  const params = new URLSearchParams(window.location.hash.replace(/^#/, ''))
+  const encoded = params.get('postamat_key') ?? ''
+  if (!encoded) throw new Error('Missing browser receive key in URL fragment.')
+  const key = base64ToBytes(encoded)
+  if (key.byteLength !== 32) throw new Error('Invalid browser receive key length.')
+  return key
+}
+
+async function prepareBrowserReceive(transfer: PublicTransfer, browserAgentID: string) {
+  if (receiveState?.transfer.transfer_id === transfer.transfer_id) return
+  const rawKey = readBrowserTransferKey()
+  const key = await crypto.subtle.importKey('raw', rawKey, 'AES-GCM', false, ['decrypt'])
+  receiveState = { transfer, browserAgentID, key, chunks: [], totalBytes: 0, nextSeq: 0, hasherReady: true, pendingICE: [], completed: false }
+  setStatus('Browser receiver key loaded; waiting for WebRTC offer.')
+}
+
+async function acceptWebRTCOffer(ws: WebSocket, transfer: PublicTransfer, browserAgentID: string, payload: unknown) {
+  await prepareBrowserReceive(transfer, browserAgentID)
+  const state = receiveState
+  if (!state) throw new Error('Browser receive state was not initialized.')
+  const peer = new RTCPeerConnection()
+  state.peer?.close()
+  state.peer = peer
+  peer.onicecandidate = (event) => {
+    if (!event.candidate) return
+    sendEnvelope(ws, {
+      type: 'webrtc.ice',
+      transfer_id: transfer.transfer_id,
+      from_agent_id: browserAgentID,
+      to_agent_id: transfer.from_agent_id,
+      payload: event.candidate.toJSON(),
+    })
+  }
+  peer.ondatachannel = (event) => {
+    state.channel = event.channel
+    state.channel.binaryType = 'arraybuffer'
+    state.channel.onopen = () => {
+      setStatus('Data channel open; receiving encrypted chunks…')
+      logEvent(`Data channel ${state.channel?.label ?? ''} opened.`)
+    }
+    state.channel.onmessage = (message) => {
+      void handleDataChannelMessage(ws, state, message.data)
+    }
+    state.channel.onerror = () => {
+      if (state.completed) return
+      setStatus('Data channel error.')
+      logEvent('Data channel error.')
+    }
+  }
+  await peer.setRemoteDescription(payload as RTCSessionDescriptionInit)
+  for (const candidate of state.pendingICE.splice(0)) {
+    await peer.addIceCandidate(candidate)
+  }
+  const answer = await peer.createAnswer()
+  await peer.setLocalDescription(answer)
+  sendEnvelope(ws, {
+    type: 'webrtc.answer',
+    transfer_id: transfer.transfer_id,
+    from_agent_id: browserAgentID,
+    to_agent_id: transfer.from_agent_id,
+    payload: peer.localDescription?.toJSON() ?? answer,
+  })
+  setStatus('WebRTC answer sent; waiting for data channel.')
+}
+
+async function handleDataChannelMessage(ws: WebSocket, state: BrowserReceiveState, data: string | ArrayBuffer | Blob) {
+  try {
+    const raw = await dataChannelPayloadToString(data)
+    const frame = JSON.parse(raw) as ChunkFrame | ManifestFrame
+    if (frame.transfer_id !== state.transfer.transfer_id) throw new Error('Unexpected transfer id.')
+    if (frame.type === 'chunk') {
+      await acceptBrowserChunk(ws, state, frame)
+      return
+    }
+    if (frame.type === 'manifest') {
+      await completeBrowserReceive(ws, state, frame)
+      return
+    }
+    throw new Error('Unsupported frame type.')
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Browser receive failed.'
+    setStatus(message)
+    logEvent(message)
+    sendEnvelope(ws, {
+      type: 'transfer.failed',
+      transfer_id: state.transfer.transfer_id,
+      from_agent_id: state.browserAgentID,
+      to_agent_id: state.transfer.from_agent_id,
+      payload: { reason: message },
+    })
+  }
+}
+
+async function acceptBrowserChunk(ws: WebSocket, state: BrowserReceiveState, frame: ChunkFrame) {
+  const seq = frame.seq ?? 0
+  const offset = frame.offset ?? 0
+  if (seq !== state.nextSeq) throw new Error('Unexpected chunk sequence.')
+  if (offset !== state.totalBytes) throw new Error('Unexpected chunk offset.')
+  if (!frame.data || !frame.enc || frame.enc.alg !== 'AES-256-GCM') throw new Error('Encrypted chunk is required.')
+  const ciphertext = base64ToBytes(frame.data)
+  const plaintext = new Uint8Array(await crypto.subtle.decrypt({
+    name: 'AES-GCM',
+    iv: base64ToBytes(frame.enc.nonce),
+    additionalData: chunkAAD(frame.transfer_id, seq, offset),
+  }, state.key, ciphertext))
+  if (state.totalBytes + plaintext.byteLength > state.transfer.file_size_bytes) throw new Error('Received bytes exceed declared file size.')
+  state.chunks.push(plaintext as Uint8Array<ArrayBuffer>)
+  state.totalBytes += plaintext.byteLength
+  state.nextSeq += 1
+  setStatus(`Receiving… ${formatBytes(state.totalBytes)} of ${formatBytes(state.transfer.file_size_bytes)}`)
+  sendEnvelope(ws, {
+    type: 'transfer.progress',
+    transfer_id: state.transfer.transfer_id,
+    from_agent_id: state.browserAgentID,
+    to_agent_id: state.transfer.from_agent_id,
+    payload: { progress_bytes: state.totalBytes },
+  })
+}
+
+async function completeBrowserReceive(ws: WebSocket, state: BrowserReceiveState, frame: ManifestFrame) {
+  if (frame.total_bytes !== state.totalBytes || frame.chunk_count !== state.nextSeq) throw new Error('Manifest size/count mismatch.')
+  const received = concatChunks(state.chunks, state.totalBytes)
+  const digest = bytesToHex(new Uint8Array(await crypto.subtle.digest('SHA-256', received)))
+  if (digest !== frame.sha256) throw new Error('Manifest SHA-256 mismatch.')
+  const blob = new Blob([received], { type: state.transfer.mime_type || 'application/octet-stream' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = state.transfer.file_name
+  link.textContent = `Download ${state.transfer.file_name}`
+  link.className = 'download-link'
+  document.querySelector('.card')?.append(link)
+  link.click()
+  setTimeout(() => URL.revokeObjectURL(url), 60_000)
+  setStatus(`Transfer complete. SHA-256 ${digest}`)
+  logEvent(`Received ${formatBytes(state.totalBytes)}; SHA-256 verified.`)
+  state.completed = true
+  sendEnvelope(ws, {
+    type: 'transfer.completed',
+    transfer_id: state.transfer.transfer_id,
+    from_agent_id: state.browserAgentID,
+    to_agent_id: state.transfer.from_agent_id,
+  })
+}
+
+async function dataChannelPayloadToString(data: string | ArrayBuffer | Blob): Promise<string> {
+  if (typeof data === 'string') return data
+  if (data instanceof Blob) return await data.text()
+  return new TextDecoder().decode(data)
+}
+
+function chunkAAD(transferID: string, sequence: number, offset: number): Uint8Array<ArrayBuffer> {
+  return new TextEncoder().encode(`postamat:p2p:v1:${transferID}:${sequence}:${offset}`) as Uint8Array<ArrayBuffer>
+}
+
+function base64ToBytes(value: string): Uint8Array<ArrayBuffer> {
+  const normalized = value.replace(/-/g, '+').replace(/_/g, '/')
+  const padded = normalized.padEnd(normalized.length + ((4 - normalized.length % 4) % 4), '=')
+  const binary = atob(padded)
+  const out = new Uint8Array(new ArrayBuffer(binary.length))
+  for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i)
+  return out
+}
+
+function concatChunks(chunks: Uint8Array<ArrayBuffer>[], totalBytes: number): Uint8Array<ArrayBuffer> {
+  const out = new Uint8Array(new ArrayBuffer(totalBytes))
+  let offset = 0
+  for (const chunk of chunks) {
+    out.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return out
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
 function isExpectedSenderEnvelope(envelope: SignalingEnvelope, transfer: PublicTransfer, browserAgentID: string): boolean {

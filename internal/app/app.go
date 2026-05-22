@@ -2,12 +2,15 @@ package app
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -153,11 +156,74 @@ func agentdHandler(ctx context.Context, opts Options, jobs *agentd.JobManager) (
 		deviceID = envOrDefault("POSTAMAT_DEVICE_ID", "agentd-local")
 	}
 	agentToken := agentAuthTokenFromOptions(opts)
-	loop := agentd.NewBackendLoop(agentd.BackendLoopOptions{AgentID: agentID, DeviceID: deviceID, Jobs: jobs, Client: agentd.NewBackendClient(backendURL, nil), AgentAuthToken: agentToken})
+	privateKey, err := parseKeyBytes(os.Getenv("POSTAMAT_AGENT_PRIVATE_KEY"), 32)
+	if err != nil {
+		return nil, fmt.Errorf("POSTAMAT_AGENT_PRIVATE_KEY: %w", err)
+	}
+	recipientPublicKeys, err := parseAgentKeyMap(os.Getenv("POSTAMAT_RECIPIENT_PUBLIC_KEYS"), 32)
+	if err != nil {
+		return nil, fmt.Errorf("POSTAMAT_RECIPIENT_PUBLIC_KEYS: %w", err)
+	}
+	publicBaseURL := envOrDefault("POSTAMAT_PUBLIC_BASE_URL", backendURL)
+	loop := agentd.NewBackendLoop(agentd.BackendLoopOptions{AgentID: agentID, DeviceID: deviceID, Jobs: jobs, Inbox: inboxForAgent(agentID), Client: agentd.NewBackendClient(backendURL, nil), AgentPrivateKey: privateKey, RecipientPublicKeys: recipientPublicKeys, PublicBaseURL: publicBaseURL, AgentAuthToken: agentToken})
 	if agentToken != "" {
 		go func() { _ = loop.RunReceiver(ctx) }()
 	}
 	return agentd.NewLocalRouterWithBackendContext(ctx, jobs, loop), nil
+}
+
+func inboxForAgent(agentID string) *agentd.Inbox {
+	root := os.Getenv("POSTAMAT_INBOX_DIR")
+	if root == "" {
+		root = filepath.Join(os.TempDir(), "postamat", "inbox", agentID)
+	}
+	return agentd.NewInbox(root, nil)
+}
+
+func parseAgentKeyMap(raw string, wantLen int) (map[string][]byte, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	keys := make(map[string][]byte)
+	for _, entry := range strings.Split(raw, ",") {
+		parts := strings.SplitN(strings.TrimSpace(entry), ":", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || parts[1] == "" {
+			return nil, errors.New("must be comma-separated agent_id:key pairs")
+		}
+		key, err := parseKeyBytes(parts[1], wantLen)
+		if err != nil {
+			return nil, err
+		}
+		keys[strings.TrimSpace(parts[0])] = key
+	}
+	return keys, nil
+}
+
+func parseKeyBytes(raw string, wantLen int) ([]byte, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, nil
+	}
+	decoders := []func(string) ([]byte, error){
+		base64.StdEncoding.DecodeString,
+		base64.RawStdEncoding.DecodeString,
+		base64.URLEncoding.DecodeString,
+		base64.RawURLEncoding.DecodeString,
+		hex.DecodeString,
+	}
+	var lastErr error
+	for _, decode := range decoders {
+		decoded, err := decode(trimmed)
+		if err == nil {
+			if len(decoded) != wantLen {
+				lastErr = fmt.Errorf("decoded key length %d, want %d", len(decoded), wantLen)
+				continue
+			}
+			return decoded, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
 }
 
 func localSocketPath(opts Options) string {

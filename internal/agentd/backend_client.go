@@ -25,6 +25,7 @@ var (
 	ErrOfferRecipientMismatch = errors.New("offer recipient does not match local agent")
 	ErrOfferDeniedByPolicy    = errors.New("offer denied by receive policy")
 	ErrAgentAuthTokenRequired = errors.New("agent auth token is required")
+	ErrPublicTokenRequired    = errors.New("public token is required")
 )
 
 type BackendClient struct {
@@ -36,6 +37,7 @@ type BackendClient struct {
 type CreateBackendTransferInput struct {
 	FromAgentID   string
 	ToAgentID     string
+	BrowserLink   bool
 	FileName      string
 	FileSizeBytes int64
 }
@@ -43,6 +45,7 @@ type CreateBackendTransferInput struct {
 type CreatedBackendTransfer struct {
 	TransferID  string `json:"transfer_id"`
 	AgentTicket string `json:"agent_ticket"`
+	PublicToken string `json:"public_token"`
 	Status      string `json:"status"`
 }
 
@@ -59,12 +62,18 @@ func (c *BackendClient) CreateTransfer(ctx context.Context, input CreateBackendT
 		return CreatedBackendTransfer{}, ErrBackendURLRequired
 	}
 	endpoint := c.resolve("/api/v1/transfers")
+	target := sessions.TargetAgent
+	if input.BrowserLink {
+		target = sessions.TargetBrowserLink
+	}
 	payload := map[string]any{
 		"from_agent_id":   input.FromAgentID,
-		"to_agent_id":     input.ToAgentID,
-		"target":          sessions.TargetAgent,
+		"target":          target,
 		"file_name":       input.FileName,
 		"file_size_bytes": input.FileSizeBytes,
+	}
+	if input.ToAgentID != "" {
+		payload["to_agent_id"] = input.ToAgentID
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -198,6 +207,7 @@ type BackendLoopOptions struct {
 	ReceivePolicy       ReceivePolicy
 	AgentPrivateKey     []byte
 	RecipientPublicKeys map[string][]byte
+	PublicBaseURL       string
 	GenerateTransferKey func() (p2p.TransferKey, error)
 	AgentAuthToken      string
 }
@@ -251,6 +261,7 @@ type BackendLoop struct {
 	receivePolicy       ReceivePolicy
 	agentPrivateKey     []byte
 	recipientPublicKeys map[string][]byte
+	publicBaseURL       string
 	generateTransferKey func() (p2p.TransferKey, error)
 	agentAuthToken      string
 	live                map[string]*liveWebRTCSession
@@ -280,6 +291,7 @@ func NewBackendLoop(options BackendLoopOptions) *BackendLoop {
 		receivePolicy:       options.ReceivePolicy,
 		agentPrivateKey:     append([]byte(nil), options.AgentPrivateKey...),
 		recipientPublicKeys: clonePublicKeys(options.RecipientPublicKeys),
+		publicBaseURL:       strings.TrimRight(options.PublicBaseURL, "/"),
 		generateTransferKey: generateKey,
 		agentAuthToken:      options.AgentAuthToken,
 		live:                make(map[string]*liveWebRTCSession),
@@ -305,7 +317,7 @@ func (l *BackendLoop) CreateSendTransfer(ctx context.Context, input CreateSendJo
 	if err != nil {
 		return Job{}, err
 	}
-	created, err := l.client.CreateTransfer(ctx, CreateBackendTransferInput{FromAgentID: l.agentID, ToAgentID: input.ToAgentID, FileName: input.FileName, FileSizeBytes: input.FileSizeBytes})
+	created, err := l.client.CreateTransfer(ctx, CreateBackendTransferInput{FromAgentID: l.agentID, ToAgentID: input.ToAgentID, BrowserLink: input.BrowserLink, FileName: input.FileName, FileSizeBytes: input.FileSizeBytes})
 	if err != nil {
 		_, _ = l.jobs.Fail(job.ID, err.Error())
 		return Job{}, err
@@ -314,7 +326,26 @@ func (l *BackendLoop) CreateSendTransfer(ctx context.Context, input CreateSendJo
 	if err != nil {
 		return Job{}, err
 	}
-	if recipientPublicKey := l.recipientPublicKeys[input.ToAgentID]; len(recipientPublicKey) > 0 {
+	if input.BrowserLink {
+		if created.PublicToken == "" {
+			_, _ = l.jobs.Fail(job.ID, ErrPublicTokenRequired.Error())
+			return Job{}, ErrPublicTokenRequired
+		}
+		transferKey, err := l.generateTransferKey()
+		if err != nil {
+			_, _ = l.jobs.Fail(job.ID, err.Error())
+			return Job{}, err
+		}
+		job, err = l.jobs.AttachTransferKey(job.ID, transferKey)
+		if err != nil {
+			return Job{}, err
+		}
+		browserURL := l.browserURL(created.PublicToken, transferKey)
+		job, err = l.jobs.AttachPublicLink(job.ID, created.PublicToken, browserURL)
+		if err != nil {
+			return Job{}, err
+		}
+	} else if recipientPublicKey := l.recipientPublicKeys[input.ToAgentID]; len(recipientPublicKey) > 0 {
 		transferKey, err := l.generateTransferKey()
 		if err != nil {
 			_, _ = l.jobs.Fail(job.ID, err.Error())
@@ -330,6 +361,13 @@ func (l *BackendLoop) CreateSendTransfer(ctx context.Context, input CreateSendJo
 		}
 	}
 	return l.jobs.MarkOffered(job.ID)
+}
+
+func (l *BackendLoop) browserURL(publicToken string, key p2p.TransferKey) string {
+	if publicToken == "" || l.publicBaseURL == "" {
+		return ""
+	}
+	return l.publicBaseURL + "/p/" + url.PathEscape(publicToken) + "#" + p2p.NewBrowserKeyFragment(key).Fragment
 }
 
 func (l *BackendLoop) CancelTransfer(ctx context.Context, jobIDOrTransferID string) (Job, error) {
@@ -538,7 +576,11 @@ func (l *BackendLoop) sendTransferOffer(send func(signaling.Envelope) error, job
 		FileName:      job.FileName,
 		FileSizeBytes: job.FileSizeBytes,
 	}
-	if job.HasTransferKey {
+	toAgentID := job.ToAgentID
+	if job.BrowserLink {
+		toAgentID = browserRecipientAgentID(job.TransferID)
+	}
+	if job.HasTransferKey && !job.BrowserLink {
 		recipientPublicKey := l.recipientPublicKeys[job.ToAgentID]
 		if len(recipientPublicKey) == 0 {
 			return ErrTransferKeyRequired
@@ -553,7 +595,11 @@ func (l *BackendLoop) sendTransferOffer(send func(signaling.Envelope) error, job
 	if err != nil {
 		return err
 	}
-	return send(signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: job.TransferID, FromAgentID: l.agentID, ToAgentID: job.ToAgentID, Payload: payload})
+	return send(signaling.Envelope{Type: signaling.MessageTransferOffer, TransferID: job.TransferID, FromAgentID: l.agentID, ToAgentID: toAgentID, Payload: payload})
+}
+
+func browserRecipientAgentID(transferID string) string {
+	return "browser_recipient:" + transferID
 }
 
 func (l *BackendLoop) ConnectTransfer(ctx context.Context, transferID string, ticket string) (*websocket.Conn, error) {
@@ -776,6 +822,9 @@ func (l *BackendLoop) validateIncomingTransferEnvelope(envelope signaling.Envelo
 
 func expectedPeerAgentID(job Job) string {
 	if job.Direction == JobDirectionSend {
+		if job.BrowserLink {
+			return browserRecipientAgentID(job.TransferID)
+		}
 		return job.ToAgentID
 	}
 	return job.FromAgentID
@@ -1149,6 +1198,11 @@ func (l *BackendLoop) markTransferStarted(transferID string) error {
 		return ErrJobNotFound
 	}
 	switch job.Status {
+	case JobStatusOffered:
+		if _, err := l.jobs.MarkAccepted(job.ID); err != nil {
+			return err
+		}
+		fallthrough
 	case JobStatusAccepted:
 		if _, err := l.jobs.MarkConnecting(job.ID); err != nil {
 			return err
@@ -1175,6 +1229,12 @@ func (l *BackendLoop) completeTransferJob(transferID string) error {
 	}
 	if job.Status == JobStatusCompleted {
 		return nil
+	}
+	if job.Status != JobStatusTransferring {
+		return ErrInvalidJobStatus
+	}
+	if job.Direction == JobDirectionSend && job.ProgressBytes != job.FileSizeBytes {
+		return ErrProgressOutOfRange
 	}
 	_, err := l.jobs.Complete(job.ID)
 	return err
