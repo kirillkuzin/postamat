@@ -2,6 +2,7 @@ package agentd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/kirillkuzin/postamat/internal/p2p"
 	"github.com/kirillkuzin/postamat/internal/signaling"
 )
 
@@ -139,7 +141,7 @@ func TestLocalAPIRunTransferErrorDoesNotFailRetryableJob(t *testing.T) {
 	job = markRetryableJobForTest(t, manager, job.ID, 10)
 	router := NewLocalRouterWithBackend(manager, nil).(*LocalRouter)
 
-	router.handleRunTransferError(job.ID, errors.New("retryable runtime interruption"))
+	router.handleRunTransferError(job, errors.New("retryable runtime interruption"))
 
 	final, err := manager.Get(job.ID)
 	if err != nil {
@@ -147,6 +149,86 @@ func TestLocalAPIRunTransferErrorDoesNotFailRetryableJob(t *testing.T) {
 	}
 	if final.Status != JobStatusRetryable {
 		t.Fatalf("status = %s, want retryable", final.Status)
+	}
+}
+
+func TestLocalAPIResumeRetryableBackendTransferStartsFreshRun(t *testing.T) {
+	messages := make(chan signaling.Envelope, 2)
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/api/v1/agent/ws" {
+			t.Fatalf("unexpected backend request %s %s", req.Method, req.URL.Path)
+		}
+		conn, err := upgrader.Upgrade(w, req, nil)
+		if err != nil {
+			t.Fatalf("upgrade backend ws: %v", err)
+		}
+		defer conn.Close()
+		for i := 0; i < 2; i++ {
+			var envelope signaling.Envelope
+			if err := conn.ReadJSON(&envelope); err != nil {
+				t.Fatalf("read backend resume message %d: %v", i, err)
+			}
+			messages <- envelope
+		}
+		<-req.Context().Done()
+	}))
+	defer backend.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager := NewJobManager(nil)
+	job, err := manager.CreateSendJob(CreateSendJobInput{SourcePath: "/tmp/report.pdf", ToAgentID: "agent-b", FileName: "report.pdf", FileSizeBytes: 42})
+	if err != nil {
+		t.Fatalf("CreateSendJob: %v", err)
+	}
+	job, err = manager.AttachTransfer(job.ID, "tr_resume", "ticket")
+	if err != nil {
+		t.Fatalf("AttachTransfer: %v", err)
+	}
+	key, err := p2p.NewRandomTransferKey()
+	if err != nil {
+		t.Fatalf("NewRandomTransferKey: %v", err)
+	}
+	if _, err := manager.AttachTransferKey(job.ID, key); err != nil {
+		t.Fatalf("AttachTransferKey: %v", err)
+	}
+	job, err = manager.MarkOffered(job.ID)
+	if err != nil {
+		t.Fatalf("MarkOffered: %v", err)
+	}
+	job, err = manager.MarkAccepted(job.ID)
+	if err != nil {
+		t.Fatalf("MarkAccepted: %v", err)
+	}
+	job = markRetryableJobForTest(t, manager, job.ID, 10)
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-a", DeviceID: "dev-1", Jobs: manager, Client: NewBackendClient(backend.URL, backend.Client()), RecipientPublicKeys: map[string][]byte{"agent-b": bytes.Repeat([]byte{1}, 32)}})
+	handler := NewLocalRouterWithBackendContext(ctx, manager, loop)
+
+	resumeRec := httptest.NewRecorder()
+	handler.ServeHTTP(resumeRec, httptest.NewRequest(http.MethodPost, "/local/v1/transfers/tr_resume/resume", nil))
+	if resumeRec.Code != http.StatusAccepted {
+		t.Fatalf("resume status = %d, body = %s", resumeRec.Code, resumeRec.Body.String())
+	}
+	var resumeResponse jobResponse
+	if err := json.NewDecoder(resumeRec.Body).Decode(&resumeResponse); err != nil {
+		t.Fatalf("decode resume response: %v", err)
+	}
+	if resumeResponse.Status != string(JobStatusConnecting) {
+		t.Fatalf("resume response status = %s, want connecting claim", resumeResponse.Status)
+	}
+	duplicateRec := httptest.NewRecorder()
+	handler.ServeHTTP(duplicateRec, httptest.NewRequest(http.MethodPost, "/local/v1/transfers/tr_resume/resume", nil))
+	if duplicateRec.Code != http.StatusBadRequest {
+		t.Fatalf("duplicate resume status = %d, body = %s", duplicateRec.Code, duplicateRec.Body.String())
+	}
+	gotHello := readSignalingMessage(t, messages, "resume hello")
+	if gotHello.Type != signaling.MessageAgentHello || gotHello.TransferID != "tr_resume" {
+		t.Fatalf("unexpected resume hello: %+v", gotHello)
+	}
+	gotOffer := readSignalingMessage(t, messages, "resume offer")
+	if gotOffer.Type != signaling.MessageTransferOffer || gotOffer.TransferID != "tr_resume" || gotOffer.FromAgentID != "agent-a" || gotOffer.ToAgentID != "agent-b" {
+		t.Fatalf("unexpected resume offer: %+v", gotOffer)
 	}
 }
 

@@ -115,22 +115,25 @@ func (r *LocalRouter) createSendJob(req *http.Request, input CreateSendJobInput)
 			return Job{}, err
 		}
 		go func() {
-			r.handleRunTransferError(job.ID, r.backend.RunTransfer(r.ctx, job))
+			r.handleRunTransferError(job, r.backend.RunTransfer(r.ctx, job))
 		}()
 		return job, nil
 	}
 	return r.jobs.CreateSendJob(input)
 }
 
-func (r *LocalRouter) handleRunTransferError(jobID string, runErr error) {
+func (r *LocalRouter) handleRunTransferError(runJob Job, runErr error) {
 	if runErr == nil || r.ctx.Err() != nil {
 		return
 	}
-	job, err := r.jobs.Get(jobID)
+	job, err := r.jobs.Get(runJob.ID)
+	if err == nil && job.UpdatedAt.After(runJob.UpdatedAt) {
+		return
+	}
 	if err == nil && (job.Status == JobStatusRetryable || job.Status == JobStatusInterrupted) {
 		return
 	}
-	_, _ = r.jobs.Fail(jobID, runErr.Error())
+	_, _ = r.jobs.Fail(runJob.ID, runErr.Error())
 }
 
 func (r *LocalRouter) handleTransfer(w http.ResponseWriter, req *http.Request) {
@@ -148,6 +151,8 @@ func (r *LocalRouter) handleTransfer(w http.ResponseWriter, req *http.Request) {
 		switch parts[1] {
 		case "cancel":
 			r.handleCancelTransfer(w, req, jobID)
+		case "resume":
+			r.handleResumeTransfer(w, req, jobID)
 		case "events":
 			r.handleTransferEvents(w, req, jobID)
 		default:
@@ -188,6 +193,35 @@ func (r *LocalRouter) handleCancelTransfer(w http.ResponseWriter, req *http.Requ
 		return
 	}
 	writeLocalJSON(w, http.StatusOK, newJobResponse(job))
+}
+
+func (r *LocalRouter) handleResumeTransfer(w http.ResponseWriter, req *http.Request, jobID string) {
+	if req.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if r.backend == nil {
+		writeLocalError(w, statusForJobError(ErrBackendClientRequired), ErrBackendClientRequired.Error())
+		return
+	}
+	job, err := r.jobByIDOrTransferID(jobID)
+	if err != nil {
+		writeLocalError(w, statusForJobError(err), err.Error())
+		return
+	}
+	if job.Direction != JobDirectionSend || job.Status != JobStatusRetryable {
+		writeLocalError(w, statusForJobError(ErrInvalidJobStatus), ErrInvalidJobStatus.Error())
+		return
+	}
+	claimed, err := r.jobs.ClaimRetryable(job.ID)
+	if err != nil {
+		writeLocalError(w, statusForJobError(err), err.Error())
+		return
+	}
+	go func() {
+		r.handleRunTransferError(claimed, r.backend.RunTransfer(r.ctx, claimed))
+	}()
+	writeLocalJSON(w, http.StatusAccepted, newJobResponse(claimed))
 }
 
 func (r *LocalRouter) handleTransferEvents(w http.ResponseWriter, req *http.Request, jobID string) {
@@ -248,7 +282,7 @@ func statusForJobError(err error) int {
 	switch {
 	case errors.Is(err, ErrJobNotFound):
 		return http.StatusNotFound
-	case errors.Is(err, ErrSourcePathRequired), errors.Is(err, ErrTargetAgentRequired), errors.Is(err, ErrBrowserTargetConflict), errors.Is(err, ErrFromAgentRequired), errors.Is(err, ErrFileNameRequired), errors.Is(err, ErrFileSizeNegative), errors.Is(err, ErrTransferIDRequired), errors.Is(err, ErrDuplicateTransferID), errors.Is(err, ErrProgressOutOfRange), errors.Is(err, ErrJobTerminal), errors.Is(err, ErrInvalidJobStatus), errors.Is(err, ErrFailureReasonRequired):
+	case errors.Is(err, ErrSourcePathRequired), errors.Is(err, ErrTargetAgentRequired), errors.Is(err, ErrBrowserTargetConflict), errors.Is(err, ErrFromAgentRequired), errors.Is(err, ErrFileNameRequired), errors.Is(err, ErrFileSizeNegative), errors.Is(err, ErrTransferIDRequired), errors.Is(err, ErrDuplicateTransferID), errors.Is(err, ErrProgressOutOfRange), errors.Is(err, ErrJobTerminal), errors.Is(err, ErrInvalidJobStatus), errors.Is(err, ErrFailureReasonRequired), errors.Is(err, ErrBackendClientRequired):
 		return http.StatusBadRequest
 	default:
 		return http.StatusInternalServerError

@@ -160,6 +160,35 @@ func TestServiceListActiveExcludesTerminalTransfers(t *testing.T) {
 	}
 }
 
+func TestServiceListActiveExcludesExpiredByClock(t *testing.T) {
+	now := time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC)
+	service := sessions.NewService(sessions.NewMemoryRepository(), &fakeTokenIssuer{}, func() time.Time { return now })
+	expired, err := service.CreateTransfer(context.Background(), validTransferInput(func(input *sessions.CreateTransferInput) {
+		input.Now = now
+		input.TTL = time.Minute
+	}))
+	if err != nil {
+		t.Fatalf("CreateTransfer expired returned error: %v", err)
+	}
+	active, err := service.CreateTransfer(context.Background(), validTransferInput(func(input *sessions.CreateTransferInput) {
+		input.Now = now
+		input.FileName = "active.pdf"
+		input.TTL = 10 * time.Minute
+	}))
+	if err != nil {
+		t.Fatalf("CreateTransfer active returned error: %v", err)
+	}
+	now = now.Add(2 * time.Minute)
+
+	listed, err := service.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive returned error: %v", err)
+	}
+	if len(listed) != 1 || listed[0].ID != active.Transfer.ID {
+		t.Fatalf("active transfers = %#v, want only non-expired %q; expired=%q", listed, active.Transfer.ID, expired.Transfer.ID)
+	}
+}
+
 func TestServiceCanMarkFailedAndExpired(t *testing.T) {
 	service := newTestService()
 	created, err := service.CreateTransfer(context.Background(), validTransferInput(nil))

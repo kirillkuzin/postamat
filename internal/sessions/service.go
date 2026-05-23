@@ -187,7 +187,17 @@ func (s *Service) VerifyBrowserReceiverTicket(ctx context.Context, rawPublicToke
 }
 
 func (s *Service) ListActive(ctx context.Context) ([]TransferSession, error) {
-	return s.repo.ListActive(ctx)
+	transfers, err := s.repo.ListActive(ctx)
+	if err != nil {
+		return nil, err
+	}
+	active := transfers[:0]
+	for _, transfer := range transfers {
+		if s.isTransferUsable(transfer) {
+			active = append(active, transfer)
+		}
+	}
+	return active, nil
 }
 
 func (s *Service) VerifyTransferUsable(ctx context.Context, transferID string) (TransferSession, error) {

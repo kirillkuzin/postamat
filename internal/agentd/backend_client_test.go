@@ -170,6 +170,119 @@ func TestBackendLoopLiveTwoAgentWebRTCRuntimeTransfersInboxFile(t *testing.T) {
 	}
 }
 
+func TestBackendLoopLiveTwoAgentWebRTCRuntimeResumesInterruptedLargeTransferAndVerifiesSHA256(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	payload := bytes.Repeat([]byte("large-interrupted-resume-0123456789abcdef"), 1024*1024)
+	sourcePath := filepath.Join(t.TempDir(), "large.bin")
+	if err := os.WriteFile(sourcePath, payload, 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	service := sessions.NewService(sessions.NewMemoryRepository(), sessions.RandomTokenIssuer{}, nil)
+	authenticator, err := api.NewStaticAgentTokenAuthenticator(map[string]string{"agent-b": "token-b"}, "test-pepper")
+	if err != nil {
+		t.Fatalf("NewStaticAgentTokenAuthenticator: %v", err)
+	}
+	server := httptest.NewServer(api.NewRouterWithSignalingAndAgentAuth(service, signaling.NewPresenceRegistry(nil), nil, authenticator))
+	defer server.Close()
+	recipientPrivate, recipientPublic, err := p2p.GenerateAgentEnvelopeKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateAgentEnvelopeKeyPair: %v", err)
+	}
+	transferKey, err := p2p.NewRandomTransferKey()
+	if err != nil {
+		t.Fatalf("NewRandomTransferKey: %v", err)
+	}
+	sendJobs := NewJobManager(nil)
+	receiveJobs := NewJobManager(nil)
+	inbox := NewInbox(t.TempDir(), nil)
+	client := NewBackendClient(server.URL, server.Client())
+	senderLoop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-a", DeviceID: "dev-a", Jobs: sendJobs, Client: client, RecipientPublicKeys: map[string][]byte{"agent-b": recipientPublic}, GenerateTransferKey: func() (p2p.TransferKey, error) { return transferKey, nil }})
+	var interruptOnce sync.Once
+	interruptedSession := make(chan *liveWebRTCSession, 1)
+	var receiverLoop *BackendLoop
+	receiverLoop = NewBackendLoop(BackendLoopOptions{AgentID: "agent-b", DeviceID: "dev-b", Jobs: receiveJobs, Inbox: inbox, Client: client, AgentAuthToken: "token-b", AgentPrivateKey: recipientPrivate, liveReceiverProgressHook: func(job Job, progress p2p.Progress) {
+		if progress.BytesTransferred <= 0 || job.DestinationPath == "" {
+			return
+		}
+		if info, err := os.Stat(job.DestinationPath + ".part"); err == nil && info.Size() > 0 {
+			interruptOnce.Do(func() {
+				interruptedSession <- receiverLoop.liveSession(job.TransferID, false)
+				receiverLoop.closeLiveSession(job.TransferID)
+			})
+		}
+	}})
+	receiverDone := make(chan error, 1)
+	go func() { receiverDone <- receiverLoop.RunReceiver(ctx) }()
+	waitForAgentOnlineForTest(t, server.URL, "agent-b")
+
+	sendJob, err := senderLoop.CreateSendTransfer(ctx, CreateSendJobInput{SourcePath: sourcePath, ToAgentID: "agent-b", FileName: "large.bin", FileSizeBytes: int64(len(payload))})
+	if err != nil {
+		t.Fatalf("CreateSendTransfer: %v", err)
+	}
+	firstRunDone := make(chan error, 1)
+	go func() { firstRunDone <- senderLoop.RunTransfer(ctx, sendJob) }()
+	select {
+	case err := <-firstRunDone:
+		if !errors.Is(err, p2p.ErrTransferFailed) {
+			t.Fatalf("first RunTransfer error = %v, want retryable transfer failure", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for interrupted sender transfer: %v", ctx.Err())
+	}
+	waitForJobStatusForTest(t, ctx, sendJobs, sendJob.TransferID, JobStatusRetryable)
+	finalRetryableReceive := waitForJobStatusForTest(t, ctx, receiveJobs, sendJob.TransferID, JobStatusRetryable)
+	select {
+	case session := <-interruptedSession:
+		if session != nil {
+			select {
+			case <-session.done:
+			case <-ctx.Done():
+				t.Fatalf("timed out waiting for interrupted receiver session shutdown: %v", ctx.Err())
+			}
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for interrupt hook: %v", ctx.Err())
+	}
+	destinationPath := finalRetryableReceive.DestinationPath
+	waitForDurablePartialMatchesJobForTest(t, ctx, receiveJobs, sendJob.TransferID, destinationPath)
+
+	resumableSend, ok := sendJobs.FindByTransferID(sendJob.TransferID)
+	if !ok {
+		t.Fatal("missing retryable send job")
+	}
+	if err := senderLoop.RunTransfer(ctx, resumableSend); err != nil {
+		finalSend, _ := sendJobs.FindByTransferID(sendJob.TransferID)
+		finalReceive, _ := receiveJobs.FindByTransferID(sendJob.TransferID)
+		partialInfo, statErr := os.Stat(destinationPath + ".part")
+		partialSize := int64(-1)
+		if statErr == nil {
+			partialSize = partialInfo.Size()
+		}
+		t.Fatalf("resumed RunTransfer: %v; send=%+v receive=%+v partial_size=%d partial_stat=%v", err, finalSend, finalReceive, partialSize, statErr)
+	}
+	cancel()
+	select {
+	case err := <-receiverDone:
+		if err != nil {
+			t.Fatalf("RunReceiver returned error after cancellation: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunReceiver did not stop after resumed completion")
+	}
+	written, err := os.ReadFile(destinationPath)
+	if err != nil {
+		t.Fatalf("read resumed destination: %v", err)
+	}
+	if sha256HexForTest(written) != sha256HexForTest(payload) {
+		t.Fatal("resumed destination SHA-256 mismatch")
+	}
+	if _, err := os.Stat(destinationPath + ".part"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial should be removed after resumed completion, stat err=%v", err)
+	}
+}
+
 func TestLiveSenderResumeManifestUsesRetryableProgress(t *testing.T) {
 	payload := []byte("chunk-0000|chunk-0001|chunk-0002")
 	sourcePath := filepath.Join(t.TempDir(), "payload.txt")
@@ -252,9 +365,14 @@ func TestBackendLoopMarkTransferStartedRestartsRetryableJob(t *testing.T) {
 }
 
 func TestRetryableRuntimeErrorIncludesPreOpenDataChannelClose(t *testing.T) {
-	err := fmt.Errorf("%w: data channel closed before open", p2p.ErrTransferFailed)
-	if !isRetryableRuntimeError(err) {
-		t.Fatalf("expected pre-open data channel close to be retryable: %v", err)
+	for _, err := range []error{
+		fmt.Errorf("%w: data channel closed before open", p2p.ErrTransferFailed),
+		fmt.Errorf("%w: io: read/write on closed pipe", p2p.ErrTransferFailed),
+		fmt.Errorf("%w: sending payload data in non-established state: state=Closed", p2p.ErrTransferFailed),
+	} {
+		if !isRetryableRuntimeError(err) {
+			t.Fatalf("expected runtime close to be retryable: %v", err)
+		}
 	}
 }
 
@@ -388,6 +506,64 @@ func TestLiveReceiverPartialPreparationDiscardsStalePartialForFreshAcceptedJob(t
 	}
 	if _, err := os.Lstat(partialPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stale partial should be discarded before fresh receive, lstat err=%v", err)
+	}
+}
+
+func TestLiveReceiverPartialPreparationDiscardsStalePartialForRetryableZeroProgress(t *testing.T) {
+	destinationPath := filepath.Join(t.TempDir(), "payload.txt")
+	partialPath := destinationPath + ".part"
+	if err := os.WriteFile(partialPath, []byte("stale"), 0o600); err != nil {
+		t.Fatalf("write stale partial: %v", err)
+	}
+	jobs := NewJobManager(nil)
+	job := retryableReceiveJobForTest(t, jobs, destinationPath, "tr_zero_retry", 10, 0)
+
+	_, resumed, _, err := prepareLiveReceiverPartial(partialPath, job)
+	if err != nil {
+		t.Fatalf("prepareLiveReceiverPartial: %v", err)
+	}
+	if resumed {
+		t.Fatal("zero-progress retryable job must not resume from stale .part")
+	}
+	if _, err := os.Lstat(partialPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale zero-progress partial should be discarded, lstat err=%v", err)
+	}
+}
+
+func TestLiveReceiverPartialPreparationRejectsPartialSizeDifferentFromRetryableProgress(t *testing.T) {
+	destinationPath := filepath.Join(t.TempDir(), "payload.txt")
+	partialPath := destinationPath + ".part"
+	if err := os.WriteFile(partialPath, []byte("123456789"), 0o600); err != nil {
+		t.Fatalf("write stale partial: %v", err)
+	}
+	jobs := NewJobManager(nil)
+	job := retryableReceiveJobForTest(t, jobs, destinationPath, "tr_mismatch_retry", 10, 4)
+
+	_, _, _, err := prepareLiveReceiverPartial(partialPath, job)
+	if !errors.Is(err, p2p.ErrUnexpectedOffset) {
+		t.Fatalf("prepareLiveReceiverPartial error = %v, want ErrUnexpectedOffset", err)
+	}
+}
+
+func TestBackendLoopCancelClosesLiveSession(t *testing.T) {
+	jobs := NewJobManager(nil)
+	job, err := jobs.CreateSendJob(CreateSendJobInput{SourcePath: "/tmp/report.pdf", ToAgentID: "agent-b", FileName: "report.pdf", FileSizeBytes: 42})
+	if err != nil {
+		t.Fatalf("CreateSendJob: %v", err)
+	}
+	if _, err := jobs.AttachTransfer(job.ID, "tr_cancel_live", "ticket"); err != nil {
+		t.Fatalf("AttachTransfer: %v", err)
+	}
+	loop := NewBackendLoop(BackendLoopOptions{AgentID: "agent-a", DeviceID: "dev-a", Jobs: jobs})
+	if session := loop.liveSession("tr_cancel_live", true); session == nil {
+		t.Fatal("expected seeded live session")
+	}
+
+	if _, err := loop.CancelTransfer(context.Background(), "tr_cancel_live"); err != nil {
+		t.Fatalf("CancelTransfer: %v", err)
+	}
+	if session := loop.liveSession("tr_cancel_live", false); session != nil {
+		t.Fatal("cancel should close and remove live session")
 	}
 }
 
@@ -1220,6 +1396,87 @@ func waitForAgentOnlineForTest(t *testing.T, baseURL string, agentID string) {
 			t.Fatalf("agent %s did not become online before transfer", agentID)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForPartialProgressForTest(t *testing.T, ctx context.Context, inbox *Inbox, totalBytes int64) string {
+	t.Helper()
+	for {
+		for _, entry := range inbox.List() {
+			partialPath := entry.DestinationPath + ".part"
+			info, err := os.Stat(partialPath)
+			if err == nil && info.Size() > 0 && info.Size() < totalBytes {
+				return entry.DestinationPath
+			}
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for partial progress: %v", ctx.Err())
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
+func waitForReceiveProgressForTest(t *testing.T, ctx context.Context, jobs *JobManager, transferID string) string {
+	t.Helper()
+	for {
+		if job, ok := jobs.FindByTransferID(transferID); ok && job.ProgressBytes > 0 && job.DestinationPath != "" {
+			return job.DestinationPath
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for receive progress: %v", ctx.Err())
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+func waitForJobStatusForTest(t *testing.T, ctx context.Context, jobs *JobManager, transferID string, status JobStatus) Job {
+	t.Helper()
+	for {
+		if job, ok := jobs.FindByTransferID(transferID); ok && job.Status == status {
+			return job
+		}
+		select {
+		case <-ctx.Done():
+			if job, ok := jobs.FindByTransferID(transferID); ok {
+				t.Fatalf("timed out waiting for %s to become %s; current=%s progress=%d failure=%q: %v", transferID, status, job.Status, job.ProgressBytes, job.FailureReason, ctx.Err())
+			}
+			t.Fatalf("timed out waiting for %s to become %s; current job missing: %v", transferID, status, ctx.Err())
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
+func waitForDurablePartialMatchesJobForTest(t *testing.T, ctx context.Context, jobs *JobManager, transferID string, destinationPath string) {
+	t.Helper()
+	stable := 0
+	for {
+		job, ok := jobs.FindByTransferID(transferID)
+		if ok && job.ProgressBytes > 0 {
+			info, err := os.Stat(destinationPath + ".part")
+			if err == nil && info.Size() == job.ProgressBytes {
+				stable++
+				if stable >= 3 {
+					return
+				}
+			} else {
+				stable = 0
+			}
+		}
+		select {
+		case <-ctx.Done():
+			if job, ok := jobs.FindByTransferID(transferID); ok {
+				info, err := os.Stat(destinationPath + ".part")
+				size := int64(-1)
+				if err == nil {
+					size = info.Size()
+				}
+				t.Fatalf("timed out waiting for durable partial to match progress; progress=%d partial_size=%d stat=%v: %v", job.ProgressBytes, size, err, ctx.Err())
+			}
+			t.Fatalf("timed out waiting for durable partial; job missing: %v", ctx.Err())
+		case <-time.After(2 * time.Millisecond):
+		}
 	}
 }
 
