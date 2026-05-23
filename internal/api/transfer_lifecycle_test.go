@@ -6,6 +6,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
+
+	"github.com/kirillkuzin/postamat/internal/api"
+	"github.com/kirillkuzin/postamat/internal/sessions"
 )
 
 func TestGetTransferReturnsExistingTransfer(t *testing.T) {
@@ -53,6 +57,34 @@ func TestListActiveTransfersReturnsNonTerminalTransfers(t *testing.T) {
 	}
 	if got.Transfers[0]["transfer_id"] != active["transfer_id"] {
 		t.Fatalf("active transfer_id = %v, want %v", got.Transfers[0]["transfer_id"], active["transfer_id"])
+	}
+}
+
+func TestListActiveTransfersExcludesTTLExpiredByClock(t *testing.T) {
+	now := time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC)
+	service := sessions.NewService(sessions.NewMemoryRepository(), &fixedTokenIssuer{}, func() time.Time { return now })
+	handler := api.NewRouter(service)
+	body := []byte(`{"from_agent_id":"agent_a","to_agent_id":"agent_b","target":"agent","file_name":"expired.pdf","file_size_bytes":42,"ttl_seconds":1}`)
+	createExpired := httptest.NewRecorder()
+	handler.ServeHTTP(createExpired, httptest.NewRequest(http.MethodPost, "/api/v1/transfers", bytes.NewReader(body)))
+	if createExpired.Code != http.StatusCreated {
+		t.Fatalf("create expiring transfer status = %d, body=%s", createExpired.Code, createExpired.Body.String())
+	}
+	now = now.Add(2 * time.Second)
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/transfers?status=active", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("list active status = %d, body=%s", response.Code, response.Body.String())
+	}
+	var got struct {
+		Transfers []map[string]any `json:"transfers"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil {
+		t.Fatalf("response JSON decode: %v", err)
+	}
+	if len(got.Transfers) != 0 {
+		t.Fatalf("expired transfer should not be listed active: %#v", got.Transfers)
 	}
 }
 

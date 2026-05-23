@@ -288,6 +288,20 @@ func (m *JobManager) MarkRetryable(jobID string) (Job, error) {
 	return m.transition(jobID, JobStatusInterrupted, JobStatusRetryable)
 }
 
+func (m *JobManager) ClaimRetryable(jobID string) (Job, error) {
+	return m.update(jobID, func(job *Job, now time.Time) error {
+		if job.isTerminal() {
+			return ErrJobTerminal
+		}
+		if job.Status != JobStatusRetryable {
+			return ErrInvalidJobStatus
+		}
+		job.Status = JobStatusConnecting
+		job.UpdatedAt = now
+		return nil
+	}, JobEvent{Type: JobEventStatusChanged, Status: JobStatusConnecting})
+}
+
 func (m *JobManager) Complete(jobID string) (Job, error) {
 	return m.update(jobID, func(job *Job, now time.Time) error {
 		if job.isTerminal() {

@@ -94,3 +94,22 @@ func TestCreateTransferRejectsInvalidMetadata(t *testing.T) {
 		t.Fatalf("invalid metadata status = %d, want %d; body=%s", response.Code, http.StatusBadRequest, response.Body.String())
 	}
 }
+
+func TestCreateTransferRejectsNegativeTTLSeconds(t *testing.T) {
+	handler := newTestRouter()
+	body := []byte(`{
+		"from_agent_id":"agent_a",
+		"to_agent_id":"agent_b",
+		"target":"agent",
+		"file_name":"report.pdf",
+		"file_size_bytes":42,
+		"ttl_seconds":-1
+	}`)
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/transfers", bytes.NewReader(body)))
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("negative ttl status = %d, want %d; body=%s", response.Code, http.StatusBadRequest, response.Body.String())
+	}
+}

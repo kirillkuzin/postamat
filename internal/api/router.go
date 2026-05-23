@@ -245,7 +245,7 @@ func (r *Router) createTransfer(w http.ResponseWriter, req *http.Request) {
 		FileSizeBytes: payload.FileSizeBytes,
 		MaxDownloads:  payload.MaxDownloads,
 	}
-	if payload.TTLSeconds > 0 {
+	if payload.TTLSeconds != 0 {
 		input.TTL = time.Duration(payload.TTLSeconds) * time.Second
 	}
 

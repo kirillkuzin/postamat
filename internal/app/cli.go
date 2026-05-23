@@ -50,6 +50,8 @@ func runCLI(ctx context.Context, opts Options) error {
 		return runStatus(ctx, opts, stdout, args[1:])
 	case "cancel":
 		return runCancel(ctx, opts, stdout, args[1:])
+	case "resume":
+		return runResume(ctx, opts, stdout, args[1:])
 	case "list":
 		return newAgentdClient(localSocketPath(opts)).writeRequest(ctx, stdout, http.MethodGet, "/local/v1/transfers", nil)
 	case "inbox", "list-inbox":
@@ -168,6 +170,13 @@ func runCancel(ctx context.Context, opts Options, stdout io.Writer, args []strin
 	return newAgentdClient(localSocketPath(opts)).writeRequest(ctx, stdout, http.MethodPost, "/local/v1/transfers/"+url.PathEscape(args[0])+"/cancel", nil)
 }
 
+func runResume(ctx context.Context, opts Options, stdout io.Writer, args []string) error {
+	if len(args) != 1 || args[0] == "" {
+		return errors.New("resume requires transfer/job id")
+	}
+	return newAgentdClient(localSocketPath(opts)).writeRequest(ctx, stdout, http.MethodPost, "/local/v1/transfers/"+url.PathEscape(args[0])+"/resume", nil)
+}
+
 func createRequestFromFile(path string) (createAgentdJobRequest, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -248,7 +257,7 @@ func cliStreams(opts Options) (io.Reader, io.Writer, io.Writer) {
 }
 
 func printUsage(w io.Writer) {
-	_, _ = fmt.Fprintln(w, "usage: postamat send <file> --to-agent <agent_id> | share <file> --browser-link | status <id> | cancel <id> | list | inbox | agentd | server | mcp")
+	_, _ = fmt.Fprintln(w, "usage: postamat send <file> --to-agent <agent_id> | share <file> --browser-link | status <id> | cancel <id> | resume <id> | list | inbox | agentd | server | mcp")
 }
 
 type rpcRequest struct {
@@ -352,6 +361,7 @@ func handleMCPRequest(ctx context.Context, client *agentdClient, req rpcRequest)
 			toolSchema("create", "Create an agent or browser-link transfer through local postamat agentd."),
 			toolSchema("status", "Read transfer/job status from local postamat agentd."),
 			toolSchema("cancel", "Cancel a transfer/job through local postamat agentd."),
+			toolSchema("resume", "Resume a retryable agent-to-agent transfer through local postamat agentd."),
 			toolSchema("list", "List local transfer jobs."),
 			toolSchema("list_inbox", "List received inbox jobs."),
 		}}
@@ -379,7 +389,7 @@ func toolSchema(name string, description string) map[string]any {
 			"browser_link": map[string]any{"type": "boolean", "description": "Create a browser-link transfer instead of targeting an agent."},
 		}
 		required = []string{"source_path"}
-	case "status", "cancel":
+	case "status", "cancel", "resume":
 		properties = map[string]any{"id": map[string]any{"type": "string", "description": "Transfer id or local job id."}}
 		required = []string{"id"}
 	}
@@ -411,22 +421,23 @@ func callMCPTool(ctx context.Context, client *agentdClient, params json.RawMessa
 		req.ToAgentID = args.ToAgentID
 		req.BrowserLink = args.BrowserLink
 		return client.checkedDo(ctx, http.MethodPost, "/local/v1/transfers", req)
-	case "status":
+	case "status", "cancel", "resume":
 		var args struct {
 			ID string `json:"id"`
 		}
 		if err := json.Unmarshal(payload.Arguments, &args); err != nil {
 			return nil, err
 		}
-		return client.checkedDo(ctx, http.MethodGet, "/local/v1/transfers/"+url.PathEscape(args.ID), nil)
-	case "cancel":
-		var args struct {
-			ID string `json:"id"`
+		path := "/local/v1/transfers/" + url.PathEscape(args.ID)
+		method := http.MethodGet
+		if payload.Name == "cancel" {
+			method = http.MethodPost
+			path += "/cancel"
+		} else if payload.Name == "resume" {
+			method = http.MethodPost
+			path += "/resume"
 		}
-		if err := json.Unmarshal(payload.Arguments, &args); err != nil {
-			return nil, err
-		}
-		return client.checkedDo(ctx, http.MethodPost, "/local/v1/transfers/"+url.PathEscape(args.ID)+"/cancel", nil)
+		return client.checkedDo(ctx, method, path, nil)
 	case "list":
 		return client.checkedDo(ctx, http.MethodGet, "/local/v1/transfers", nil)
 	case "list_inbox":

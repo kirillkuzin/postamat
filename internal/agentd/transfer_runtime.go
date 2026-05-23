@@ -186,6 +186,10 @@ func (r *LocalWebRTCTransferRunner) runEncryptedLocalWebRTC(ctx context.Context,
 	receiverDone := make(chan error, 1)
 	go func() {
 		for {
+			if err := transferCtx.Err(); err != nil {
+				receiverDone <- err
+				return
+			}
 			select {
 			case <-transferCtx.Done():
 				receiverDone <- transferCtx.Err()
@@ -214,6 +218,12 @@ func (r *LocalWebRTCTransferRunner) runEncryptedLocalWebRTC(ctx context.Context,
 		},
 	})
 	if err != nil {
+		if isRetryableRuntimeError(err) {
+			preservePartial = true
+			cancelTransfer()
+			closePair()
+			<-receiverDone
+		}
 		return p2p.Manifest{}, err
 	}
 	select {
@@ -421,7 +431,7 @@ func isRetryableRuntimeError(err error) bool {
 		return true
 	}
 	message := err.Error()
-	return strings.Contains(message, context.Canceled.Error()) || strings.Contains(message, context.DeadlineExceeded.Error()) || strings.Contains(message, "remote peer closed") || strings.Contains(message, "data channel closed before open")
+	return strings.Contains(message, context.Canceled.Error()) || strings.Contains(message, context.DeadlineExceeded.Error()) || strings.Contains(message, "remote peer closed") || strings.Contains(message, "data channel closed before open") || strings.Contains(message, "read/write on closed pipe") || strings.Contains(message, "non-established state")
 }
 
 func markJobRetryableIfMutable(jobs *JobManager, jobID string, reason string) error {
