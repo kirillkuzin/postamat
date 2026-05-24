@@ -24,15 +24,16 @@ func defaultRemoteWebRTCConfiguration() webrtc.Configuration {
 }
 
 type RemoteWebRTCPeer struct {
-	mu         sync.Mutex
-	pc         *webrtc.PeerConnection
-	dc         *webrtc.DataChannel
-	incoming   chan []byte
-	open       chan struct{}
-	done       chan struct{}
-	openOnce   sync.Once
-	closeOnce  sync.Once
-	pendingICE []webrtc.ICECandidateInit
+	mu          sync.Mutex
+	signalingMu sync.Mutex
+	pc          *webrtc.PeerConnection
+	dc          *webrtc.DataChannel
+	incoming    chan []byte
+	open        chan struct{}
+	done        chan struct{}
+	openOnce    sync.Once
+	closeOnce   sync.Once
+	pendingICE  []webrtc.ICECandidateInit
 }
 
 func NewPionDataChannel(dc *webrtc.DataChannel, lowThreshold uint64) *PionDataChannel {
@@ -87,10 +88,14 @@ func (p *PionDataChannel) WaitBufferedAmountLow(ctx context.Context) error {
 }
 
 func NewRemoteWebRTCOfferPeer(label string, onICECandidate func(ICECandidate)) (*RemoteWebRTCPeer, error) {
+	return newRemoteWebRTCOfferPeer(defaultRemoteWebRTCConfiguration(), label, onICECandidate)
+}
+
+func newRemoteWebRTCOfferPeer(config webrtc.Configuration, label string, onICECandidate func(ICECandidate)) (*RemoteWebRTCPeer, error) {
 	if label == "" {
 		label = "postamat-transfer"
 	}
-	peer, err := newRemoteWebRTCPeer(onICECandidate)
+	peer, err := newRemoteWebRTCPeer(config, onICECandidate)
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +109,11 @@ func NewRemoteWebRTCOfferPeer(label string, onICECandidate func(ICECandidate)) (
 }
 
 func NewRemoteWebRTCAnswerPeer(onICECandidate func(ICECandidate)) (*RemoteWebRTCPeer, error) {
-	peer, err := newRemoteWebRTCPeer(onICECandidate)
+	return newRemoteWebRTCAnswerPeer(defaultRemoteWebRTCConfiguration(), onICECandidate)
+}
+
+func newRemoteWebRTCAnswerPeer(config webrtc.Configuration, onICECandidate func(ICECandidate)) (*RemoteWebRTCPeer, error) {
+	peer, err := newRemoteWebRTCPeer(config, onICECandidate)
 	if err != nil {
 		return nil, err
 	}
@@ -114,8 +123,8 @@ func NewRemoteWebRTCAnswerPeer(onICECandidate func(ICECandidate)) (*RemoteWebRTC
 	return peer, nil
 }
 
-func newRemoteWebRTCPeer(onICECandidate func(ICECandidate)) (*RemoteWebRTCPeer, error) {
-	pc, err := webrtc.NewPeerConnection(defaultRemoteWebRTCConfiguration())
+func newRemoteWebRTCPeer(config webrtc.Configuration, onICECandidate func(ICECandidate)) (*RemoteWebRTCPeer, error) {
+	pc, err := webrtc.NewPeerConnection(config)
 	if err != nil {
 		return nil, err
 	}
@@ -161,6 +170,8 @@ func (p *RemoteWebRTCPeer) CreateOffer() (SessionDescription, error) {
 	if p == nil || p.pc == nil {
 		return webrtc.SessionDescription{}, fmt.Errorf("%w: missing peer connection", ErrTransferFailed)
 	}
+	p.signalingMu.Lock()
+	defer p.signalingMu.Unlock()
 	offer, err := p.pc.CreateOffer(nil)
 	if err != nil {
 		return webrtc.SessionDescription{}, err
@@ -175,6 +186,8 @@ func (p *RemoteWebRTCPeer) AcceptOfferCreateAnswer(offer SessionDescription) (Se
 	if p == nil || p.pc == nil {
 		return webrtc.SessionDescription{}, fmt.Errorf("%w: missing peer connection", ErrTransferFailed)
 	}
+	p.signalingMu.Lock()
+	defer p.signalingMu.Unlock()
 	if err := p.pc.SetRemoteDescription(offer); err != nil {
 		return webrtc.SessionDescription{}, err
 	}
@@ -195,6 +208,8 @@ func (p *RemoteWebRTCPeer) AcceptAnswer(answer SessionDescription) error {
 	if p == nil || p.pc == nil {
 		return fmt.Errorf("%w: missing peer connection", ErrTransferFailed)
 	}
+	p.signalingMu.Lock()
+	defer p.signalingMu.Unlock()
 	if err := p.pc.SetRemoteDescription(answer); err != nil {
 		return err
 	}
@@ -207,6 +222,8 @@ func (p *RemoteWebRTCPeer) AddICECandidate(candidate ICECandidate) error {
 	if p == nil || p.pc == nil {
 		return fmt.Errorf("%w: missing peer connection", ErrTransferFailed)
 	}
+	p.signalingMu.Lock()
+	defer p.signalingMu.Unlock()
 	p.mu.Lock()
 	if p.pc.RemoteDescription() == nil {
 		if len(p.pendingICE) >= maxRemotePendingICECandidates {
