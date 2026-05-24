@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/pion/webrtc/v4"
 )
 
 func TestLocalWebRTCPairTransfersSmallFile(t *testing.T) {
@@ -99,31 +101,41 @@ func TestRemoteWebRTCPeersTransferWithBufferedICE(t *testing.T) {
 
 	var sender *RemoteWebRTCPeer
 	var receiver *RemoteWebRTCPeer
+	var senderICEErrors []error
+	var receiverICEErrors []error
 	var earlySenderICE []ICECandidate
 	var earlyReceiverICE []ICECandidate
 	var iceMu sync.Mutex
 	var err error
-	sender, err = NewRemoteWebRTCOfferPeer("postamat-transfer", func(candidate ICECandidate) {
+	// Keep this regression local-only: the production remote-peer constructors still
+	// include STUN (covered above), but repeated CI runs must not depend on an
+	// external STUN round trip while exercising buffered trickle ICE ordering.
+	localConfig := webrtc.Configuration{}
+	sender, err = newRemoteWebRTCOfferPeer(localConfig, "postamat-transfer", func(candidate ICECandidate) {
 		iceMu.Lock()
 		defer iceMu.Unlock()
 		if receiver == nil {
 			earlySenderICE = append(earlySenderICE, candidate)
 			return
 		}
-		_ = receiver.AddICECandidate(candidate)
+		if err := receiver.AddICECandidate(candidate); err != nil {
+			senderICEErrors = append(senderICEErrors, err)
+		}
 	})
 	if err != nil {
 		t.Fatalf("NewRemoteWebRTCOfferPeer: %v", err)
 	}
 	defer sender.Close()
-	receiver, err = NewRemoteWebRTCAnswerPeer(func(candidate ICECandidate) {
+	receiver, err = newRemoteWebRTCAnswerPeer(localConfig, func(candidate ICECandidate) {
 		iceMu.Lock()
 		defer iceMu.Unlock()
 		if sender == nil {
 			earlyReceiverICE = append(earlyReceiverICE, candidate)
 			return
 		}
-		_ = sender.AddICECandidate(candidate)
+		if err := sender.AddICECandidate(candidate); err != nil {
+			receiverICEErrors = append(receiverICEErrors, err)
+		}
 	})
 	if err != nil {
 		t.Fatalf("NewRemoteWebRTCAnswerPeer: %v", err)
@@ -160,7 +172,13 @@ func TestRemoteWebRTCPeersTransferWithBufferedICE(t *testing.T) {
 
 	senderChannel, err := sender.WaitOutboundDataChannel(ctx, 64*1024)
 	if err != nil {
-		t.Fatalf("WaitOutboundDataChannel: %v", err)
+		iceMu.Lock()
+		senderCandidateCount := len(earlySenderICE)
+		receiverCandidateCount := len(earlyReceiverICE)
+		senderErrs := append([]error(nil), senderICEErrors...)
+		receiverErrs := append([]error(nil), receiverICEErrors...)
+		iceMu.Unlock()
+		t.Fatalf("WaitOutboundDataChannel: %v (sender_state=%s receiver_state=%s sender_ice_state=%s receiver_ice_state=%s sender_candidates=%d receiver_candidates=%d sender_ice_errors=%v receiver_ice_errors=%v)", err, sender.pc.ConnectionState(), receiver.pc.ConnectionState(), sender.pc.ICEConnectionState(), receiver.pc.ICEConnectionState(), senderCandidateCount, receiverCandidateCount, senderErrs, receiverErrs)
 	}
 	incoming, err := receiver.WaitIncomingMessages(ctx)
 	if err != nil {
