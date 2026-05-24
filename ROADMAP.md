@@ -12,7 +12,7 @@ This roadmap describes public project gaps and directions. It is not a release p
 - Application-level E2E chunk encryption and manifest validation.
 - PostgreSQL-compatible repositories and migrations for metadata/audit state.
 - CI that builds frontend assets before Go tests, race tests, vet, coverage, and command builds.
-- Deployment preview with Dockerfile, Compose, Caddy, coturn, `/healthz`, and `/metrics`.
+- Deployment preview with Dockerfile, Compose, Traefik, coturn, `/healthz`, and `/metrics`.
 - CLI and MCP adapter over local `agentd` for create/status/cancel/list/inbox control-plane operations.
 - Local `postamat agentd` can attach agent-to-agent sends to backend transfer IDs and start a transfer-scoped WSS signaling connection when configured with `POSTAMAT_BACKEND_URL` + agent identity.
 - Receiver-side `agentd` policy can accept or deny incoming backend offers by sender and file-size limits, emits `transfer.accepted`/`transfer.denied`, and avoids inbox reservation for denied offers.

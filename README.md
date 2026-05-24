@@ -140,7 +140,7 @@ cp deployments/.env.example deployments/.env
 docker compose --env-file deployments/.env -f deployments/compose.yaml up --build
 ```
 
-The stack builds recipient frontend assets, packages the Go server/agentd/CLI binaries, and runs `postamat-server` behind Caddy with PostgreSQL and coturn services ready for the production persistence/WebRTC relay path. Runtime health endpoints are available at `/healthz` and `/metrics`.
+The stack builds recipient frontend assets, packages the Go server/agentd/CLI binaries, and runs `postamat-server` behind Traefik with PostgreSQL and coturn services ready for the production persistence/WebRTC relay path. Runtime health endpoints are available at `/healthz` and `/metrics`; Traefik applies HTTPS redirect, security headers, and `Cache-Control: no-store` for `/metrics`.
 
 ## Contributing
 
